@@ -7,7 +7,7 @@ MIT 协议 · Windows 10 / 11 · 不需要 Python，也不需要 Node
 
 ![冰冰播放器主界面](docs/hero.jpg)
 
-### [→ 下载最新版（Windows，解压即用）](../../releases/latest)
+### [→ 下载最新版（Windows，解压即用）](https://github.com/banshoudigua/bingbing-video-player/releases/latest)
 
 ---
 
@@ -39,7 +39,7 @@ Agent 读完成约定 → 改 HTML → 发现播放中鼠标静止时按 L 没�
 
 ## 30 秒上手
 
-1. 到 [Releases](../../releases/latest) 下载 `bingbing-player-v1.0.zip`，解压到任意文件夹
+1. 到 [Releases](https://github.com/banshoudigua/bingbing-video-player/releases/latest) 下载 `bingbing-player-v1.0.zip`，解压到任意文件夹
 2. 双击里面的 **`启动冰冰播放器.bat`**
 3. 窗口出来后，把**视频文件**或**整个文件夹**拖进去
 
