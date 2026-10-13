@@ -1,0 +1,24 @@
+# 这个项目里有两类文件**必须保持字节原样**，任何一个被 git 做了换行或编码转换，
+# 到了用户机器上就会出问题。所以在这里把规则钉死，别指望每个人的 git 配置都一样。
+
+# .bat / .cmd：必须 CRLF + GBK(936)。
+#   少了 CR，cmd 会把行首字符吞掉（setlocal 被当成 cal、cd /d 整段消失）；
+#   编码转成 UTF-8 的话，里面的中文路径全变乱码。
+*.bat -text
+*.cmd -text
+
+# .reg：必须 UTF-16LE + BOM，否则「打开方式」里中文显示乱码
+*.reg -text
+
+# 二进制，别碰
+*.exe binary
+*.ico binary
+*.png binary
+
+# 源码 / 文档按文本处理（LF 即可）
+*.py text
+*.js text
+*.ps1 text
+*.html text
+*.md text
+*.spec text

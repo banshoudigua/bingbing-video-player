@@ -1,0 +1,3605 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>冰冰播放器</title>
+<style>
+  /* ===================================================================
+     冰冰播放器 —— 单文件本地视频播放器
+     设计原则：零依赖、零框架、纯原生，内存占用最小化
+     =================================================================== */
+
+  :root {
+    --bg:        #0e1013;   /* 最底层背景 */
+    --panel:     #16191e;   /* 面板背景 */
+    --line:      #262b33;   /* 分割线 */
+    --text:      #e8eaed;   /* 主文字 */
+    --text-dim:  #98a1ad;   /* 次要文字 */
+    --accent:    #38b6ff;   /* 强调色（蓝青，非紫色系） */
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+  }
+
+  body {
+    font-family: system-ui, -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+    color: var(--text);
+    /* 播放器界面不需要选中文字，避免拖拽误选 */
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* ============ 应用根容器 ============ */
+  #app {
+    position: relative;
+    width: 100%; height: 100%;
+    background: #000;
+  }
+
+  /* 鼠标静止后进入 idle 状态，隐藏所有浮层与光标 */
+  #app.idle { cursor: none; }
+  #app.idle #controls,
+  #app.idle #topbar { opacity: 0; pointer-events: none; }
+
+  /* 尚未载入文件时隐藏控制条与顶部条，界面只留引导层 */
+  #app.no-file #controls,
+  #app.no-file #topbar { display: none; }
+
+  /* ============ 播放舞台 ============ */
+  #stage {
+    position: absolute; inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background: #000;
+  }
+
+  /* 视频框：尺寸由 JS 按所选比例动态计算。
+     这里必须裁掉溢出：滚轮放大后视频元素会大于视频框，
+     不裁的话放大的画面会盖到底部控制条和顶部文件名条上去。 */
+  #frame {
+    position: relative;
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+
+  /* 视频：绝对定位居中。
+     之所以不用普通的块级流式布局，是因为旋转 90° / 270° 时需要把
+     视频元素的宽高互换后再绕自身中心旋转，绝对定位 + translate 居中
+     才能保证转完的画面仍然准确落在视频框内。 */
+  #video {
+    position: absolute;
+    top: 50%; left: 50%;
+    width: 100%; height: 100%;
+    transform: translate(-50%, -50%);
+    object-fit: contain;       /* 填充模式由 JS 切换 */
+    background: #000;
+    outline: none;
+  }
+
+  /* ============ 音频占位层 ============ */
+  /* mp3 / flac 这类文件也是用 #video 播的，但没有视频轨 —— 画出来就是一整块黑，
+     看着像播放器坏了。这里盖一张卡片，一眼就能看出「在放歌」。
+     放在 #frame 之外（它是 #stage 的直接子元素）：
+     #frame 会被滚轮缩放、被旋转拖着跑，而这张卡片始终端正居中，不跟着变形。 */
+  #audioFace {
+    position: absolute; inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    padding: 26px;
+    text-align: center;
+    pointer-events: none;
+    /* 中间一圈很淡的蓝青辉光，比纯黑有层次，又不会喧宾夺主 */
+    background:
+      radial-gradient(56% 42% at 50% 42%, rgba(56,182,255,.10), rgba(0,0,0,0) 72%),
+      linear-gradient(160deg, #081118, #04080b 62%);
+  }
+  #app.audio-mode #audioFace { display: flex; }
+  #app.no-file #audioFace    { display: none; }   /* 空播放器时不出现 */
+
+  .af-disc {
+    width: 96px; height: 96px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    color: var(--accent);
+    background: rgba(56,182,255,.07);
+    border: 1px solid rgba(56,182,255,.26);
+    box-shadow: 0 0 0 11px rgba(56,182,255,.03), 0 12px 36px rgba(0,0,0,.55);
+  }
+  .af-disc svg { width: 44px; height: 44px; }
+
+  /* 播放中让唱片缓缓转：一眼能分清「在播」还是「停着」。
+     状态类由 video 的 play / pause 事件维护，不靠猜。 */
+  #app.audio-mode.playing .af-disc { animation: afSpin 5.5s linear infinite; }
+  @keyframes afSpin { to { transform: rotate(360deg); } }
+
+  .af-name {
+    max-width: 76%;
+    font-size: 14.5px;
+    line-height: 1.55;
+    color: var(--text);
+    word-break: break-all;
+  }
+  .af-tag {
+    padding: 3px 11px 4px;
+    font-size: 11.5px;
+    letter-spacing: .18em;
+    color: var(--accent);
+    opacity: .72;
+    border: 1px solid rgba(56,182,255,.28);
+    border-radius: 999px;
+  }
+  /* 面板展开时舞台右缩 320px，占位层跟着走（它就在 #stage 里） */
+
+  /* ============ 顶部文件名条 ============ */
+  #topbar {
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: 14px 20px 30px;
+    background: linear-gradient(to bottom, rgba(0,0,0,.72), rgba(0,0,0,0));
+    font-size: 13px;
+    color: var(--text);
+    opacity: 1;
+    /* right 的过渡用于播放列表展开 / 收起时跟着让位 */
+    transition: opacity .25s, right .22s ease;
+    pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #topbar .fname { font-weight: 500; }
+  #topbar .fmeta { color: var(--text-dim); margin-left: 10px; font-size: 12px; }
+
+  /* ============ 右上角关闭按钮 ============ */
+  /* 为什么需要它：窗口最大化或者进了全屏之后（本播放器用回车键切全屏），
+     系统标题栏的关闭按钮要么看不见、要么够不着。
+     这里常驻一个界面内的关闭入口，任何状态下点一下就能关掉整个浏览器窗口。
+     它刻意不跟 #topbar 一起在 idle 时淡出 —— 「无论什么状态都显示」是需求。 */
+  /* 关闭按钮与帮助按钮共用一套外观：都是右上角的常驻入口，
+     都不跟顶栏一起 idle 淡出（需求：无论什么状态都点得到） */
+  #winClose, #helpBtn {
+    position: absolute;
+    top: 10px;
+    width: 32px; height: 32px;
+    display: flex; align-items: center; justify-content: center;
+    padding: 0;
+    border: 1px solid rgba(255,255,255,.14);
+    border-radius: 7px;
+    background: rgba(0,0,0,.42);
+    color: var(--text);
+    cursor: pointer;
+    opacity: .5;
+    /* 分层：盖住播放列表面板（30）与拖入遮罩（40），保证任何时候都点得到 */
+    z-index: 60;
+    /* right 的过渡用于面板展开时跟着顶栏一起让位 */
+    transition: opacity .18s, right .22s ease, background .18s, border-color .18s, color .18s;
+  }
+  #winClose { right: 12px; }
+  /* 帮助按钮紧挨在关闭按钮左边 */
+  #helpBtn  { right: 52px; }
+  #winClose svg { width: 16px; height: 16px; display: block; }
+  #helpBtn svg  { width: 17px; height: 17px; display: block; }
+  #winClose:hover {
+    opacity: 1;
+    background: rgba(198,54,54,.88);
+    border-color: rgba(255,140,140,.55);
+    color: #fff;
+  }
+  #helpBtn:hover {
+    opacity: 1;
+    background: rgba(56,182,255,.88);
+    border-color: rgba(170,225,255,.6);
+    color: #04121c;
+  }
+  #winClose:active,
+  #helpBtn:active { transform: translateY(1px); }
+  /* 面板展开时向左让出 320px，与顶栏 / 控制条保持同一条竖线 */
+  #app.pl-open #winClose { right: 332px; }
+  #app.pl-open #helpBtn  { right: 372px; }
+
+  /* ============ 底部控制条 ============ */
+  #controls {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 26px 18px 12px;
+    background: linear-gradient(to top, rgba(0,0,0,.86), rgba(0,0,0,.55) 55%, rgba(0,0,0,0));
+    opacity: 1;
+    /* right 的过渡用于播放列表展开 / 收起时跟着让位 */
+    transition: opacity .25s, right .22s ease;
+  }
+
+  /* --- 进度条 --- */
+  .row-progress {
+    display: flex; align-items: center;
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+  .time {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-dim);
+    min-width: 52px;
+    text-align: center;
+    flex: 0 0 auto;
+  }
+
+  input[type=range] {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+    outline: none;
+  }
+
+  /* 进度条本体。
+     加厚分两处才真正好点选：
+       1) 轨道视觉加厚（4px → 8px），看得准
+       2) input 自身高度加到 20px，这是鼠标实际的命中区域 */
+  #progress {
+    flex: 1 1 auto;
+    height: 20px;
+  }
+  #progress::-webkit-slider-runnable-track {
+    height: 8px;
+    border-radius: 4px;
+    background: linear-gradient(to right,
+                var(--accent) var(--filled, 0%),
+                rgba(255,255,255,.22) var(--filled, 0%));
+    transition: height .12s;
+  }
+  #progress:hover::-webkit-slider-runnable-track { height: 10px; }
+  #progress::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px; height: 16px;
+    margin-top: -4px;    /* (轨道 8px - 圆点 16px) / 2，使圆点在轨道上居中 */
+    border-radius: 50%;
+    background: var(--accent);
+    /* 描一圈暗边，圆点压在粗轨道上时边界更清晰 */
+    box-shadow: 0 0 0 2px rgba(0,0,0,.45);
+    opacity: 0;
+    transition: opacity .12s;
+  }
+  #progress:hover::-webkit-slider-thumb,
+  #progress:active::-webkit-slider-thumb { opacity: 1; }
+
+  /* --- 按钮行 --- */
+  .row-buttons {
+    display: flex; align-items: center;
+    gap: 8px;
+    flex-wrap: nowrap;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center; justify-content: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background .12s, color .12s;
+    white-space: nowrap;
+    /* 不允许被压窄：窗口变窄时宁可溢出，也不要按钮变形看不清图标 */
+    flex: 0 0 auto;
+  }
+  .btn:hover { background: rgba(255,255,255,.1); }
+  .btn:active { background: rgba(255,255,255,.16); }
+  .btn.icon { width: 34px; padding: 0; }
+  .btn svg { width: 17px; height: 17px; display: block; }
+  .btn.primary { color: var(--accent); }
+
+  /* --- 播放速度按钮 --- */
+  #btnSpeed {
+    /* 最长的档位文字是「0.25x」共 5 字符，
+       宽度取够才不会在 0.25x / 1.0x 之间来回跳 */
+    min-width: 54px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: .2px;
+  }
+  /* 处于「非默认状态」时的按钮高亮：
+     播放速度不在 1.0x、或画面已被旋转，一眼就能看出来 */
+  #btnSpeed.active,
+  #btnRotL.active,
+  #btnRotR.active {
+    color: var(--accent);
+    background: rgba(56,182,255,.13);
+  }
+
+  .spacer { flex: 1 1 auto; }
+
+  /* --- 音量 --- */
+  #volume {
+    width: 80px;
+    height: 16px;
+    flex: 0 0 auto;
+  }
+  #volume::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(to right,
+                #cfd6de var(--filled, 100%),
+                rgba(255,255,255,.22) var(--filled, 100%));
+  }
+  #volume::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 11px; height: 11px;
+    margin-top: -3.5px;
+    border-radius: 50%;
+    background: #fff;
+  }
+  .vol-pct {
+    font-size: 12px;
+    color: var(--text-dim);
+    width: 34px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* --- 下拉选择（比例 / 填充） --- */
+  .select-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+  .select-wrap::after {
+    content: "";
+    position: absolute; right: 9px;
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 4px solid var(--text-dim);
+    pointer-events: none;
+  }
+  select {
+    appearance: none;
+    -webkit-appearance: none;
+    height: 32px;
+    padding: 0 24px 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: rgba(255,255,255,.05);
+    color: var(--text);
+    font-size: 12.5px;
+    font-family: inherit;
+    cursor: pointer;
+    outline: none;
+  }
+  select:hover { border-color: #3a4250; background: rgba(255,255,255,.09); }
+  select option { background: var(--panel); color: var(--text); }
+
+  .label-mini {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-right: 4px;
+    white-space: nowrap;
+  }
+
+  /* ============ 空状态（未拖入文件时） ============ */
+  #empty {
+    position: absolute; inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background: var(--bg);
+    text-align: center;
+    padding: 24px;
+  }
+  #empty.hide { display: none; }
+
+  .empty-icon {
+    width: 78px; height: 78px;
+    border-radius: 50%;
+    border: 1.5px dashed #39404b;
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 6px;
+  }
+  .empty-icon svg { width: 30px; height: 30px; fill: #59616d; }
+
+  .empty-title { font-size: 17px; font-weight: 500; }
+  .empty-sub   { font-size: 13px; color: var(--text-dim); line-height: 1.8; }
+  .empty-keys  { font-size: 12px; color: #6d7683; line-height: 2; margin-top: 4px; }
+  .empty-keys b { color: var(--text-dim); font-weight: 500; }
+
+  .pick-btn {
+    margin-top: 6px;
+    height: 34px;
+    padding: 0 18px;
+    border: 1px solid #2f3742;
+    border-radius: 7px;
+    background: rgba(255,255,255,.05);
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .pick-btn:hover { background: rgba(255,255,255,.1); border-color: #3f4a58; }
+
+  /* ============ 拖入高亮遮罩 ============ */
+  #dropMask {
+    position: absolute; inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10,14,20,.82);
+    border: 2px dashed var(--accent);
+    font-size: 17px;
+    color: var(--accent);
+    z-index: 40;
+    pointer-events: none;
+  }
+  #dropMask.show { display: flex; }
+
+  /* ============ 操作提示浮字 ============ */
+  #toast {
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%) scale(.94);
+    padding: 10px 20px;
+    border-radius: 8px;
+    background: rgba(0,0,0,.72);
+    border: 1px solid rgba(255,255,255,.14);
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    color: #fff;
+    opacity: 0;
+    transition: opacity .16s, transform .16s;
+    pointer-events: none;
+    z-index: 50;
+    white-space: pre;
+    text-align: center;
+    line-height: 1.6;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+
+  /* ============ 播放列表面板 ============ */
+  /* 收起时整块滑出到屏幕右侧之外；展开时挤压舞台，视频区域自动让出宽度 */
+  #playlist {
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border-left: 1px solid var(--line);
+    z-index: 30;
+    transform: translateX(100%);
+    transition: transform .22s ease, opacity .2s;
+  }
+  #app.pl-open #playlist { transform: translateX(0); }
+
+  /* 面板展开时，舞台 / 顶栏 / 控制条 / 空状态一起向左让出 320px */
+  #app.pl-open #stage,
+  #app.pl-open #topbar,
+  #app.pl-open #controls,
+  #app.pl-open #empty { right: 320px; }
+
+  /* 注意：#topbar 与 #controls 的 right 过渡已经并进它们各自的 transition 列表，
+     这里不能对它们再写一条 transition —— transition 是整体覆盖的简写属性，
+     写了会把原来的 opacity 淡入淡出顶掉，控制条会变成硬切 */
+  #stage, #empty { transition: right .22s ease; }
+
+  /* 播放中鼠标静止时，面板跟着顶栏控制条一起淡出。
+     【例外 · 2026-10-13】面板处于展开态时必须保持可见。
+     按 L 是纯键盘操作，不会触发 mousemove；若此前已经进了 idle，
+     setPlaylistOpen 只改 transform（pl-open），idle 类还在，
+     于是面板滑进来了却仍是 opacity:0 —— 看着就是「按 L 没反应」。
+     这条例外与 JS 里的 wakeControls() 双保险，防止将来再被改回去。 */
+  #app.idle #playlist { opacity: 0; pointer-events: none; }
+  #app.idle.pl-open #playlist { opacity: 1; pointer-events: auto; }
+
+  /* --- 面板标题行 --- */
+  .pl-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 10px 10px 13px;
+    border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  .pl-title  { font-size: 13.5px; font-weight: 500; }
+  .pl-count  { font-size: 11.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .pl-spacer { flex: 1 1 auto; }
+  .pl-x {
+    width: 24px; height: 24px;
+    border: 0; border-radius: 5px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 13px; font-family: inherit; line-height: 1;
+    cursor: pointer;
+  }
+  .pl-x:hover { background: rgba(255,255,255,.1); color: var(--text); }
+
+  /* --- 搜索与排序 --- */
+  .pl-tools {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  .pl-search-wrap { position: relative; }
+  #plSearch {
+    width: 100%;
+    height: 30px;
+    padding: 0 28px 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: rgba(255,255,255,.05);
+    color: var(--text);
+    font-size: 12.5px;
+    font-family: inherit;
+    outline: none;
+  }
+  #plSearch:focus { border-color: var(--accent); background: rgba(56,182,255,.07); }
+  #plSearch::placeholder { color: #6d7683; }
+  #plSearchClear {
+    position: absolute; right: 4px; top: 50%;
+    transform: translateY(-50%);
+    display: none;
+    width: 22px; height: 22px;
+    border: 0; border-radius: 4px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 12px; font-family: inherit; line-height: 1;
+    cursor: pointer;
+  }
+  #plSearchClear.show { display: block; }
+  #plSearchClear:hover { background: rgba(255,255,255,.12); color: var(--text); }
+
+  .pl-sortrow {
+    display: flex; align-items: center; gap: 6px;
+    margin-top: 8px;
+  }
+  #plSort {
+    flex: 1 1 auto;
+    height: 28px;
+    padding: 0 22px 0 8px;
+    font-size: 12px;
+  }
+  #plOrder {
+    flex: 0 0 auto;
+    width: 32px; height: 28px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: rgba(255,255,255,.05);
+    color: var(--text);
+    font-size: 13px; font-family: inherit; line-height: 1;
+    cursor: pointer;
+  }
+  #plOrder:hover { background: rgba(255,255,255,.1); border-color: #3a4250; }
+
+  /* --- 列表本体 --- */
+  .pl-list {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 5px 0 12px;
+  }
+  .pl-list::-webkit-scrollbar { width: 10px; }
+  .pl-list::-webkit-scrollbar-track { background: transparent; }
+  .pl-list::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,.16);
+    border-radius: 5px;
+    border: 2px solid var(--panel);
+  }
+  .pl-list::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.3); }
+
+  .pl-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 12px 6px 9px;
+    border-left: 3px solid transparent;
+    cursor: pointer;
+    /* 行尾的动作小图标要绝对定位盖上来，所以这里得有一个定位参照 */
+    position: relative;
+    /* 长列表时让浏览器跳过屏幕外条目的渲染，滚动更省资源 */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 46px;
+  }
+  .pl-item:hover { background: rgba(255,255,255,.06); }
+  .pl-item.active {
+    background: rgba(56,182,255,.13);
+    border-left-color: var(--accent);
+  }
+  /* 内核不支持其容器的文件置灰，但保留在列表里，
+     让用户看得见「文件在这个文件夹、只是播不了」，比直接隐藏更清楚 */
+  .pl-item.bad { opacity: .5; }
+
+  .pl-idx {
+    flex: 0 0 auto;
+    width: 21px;
+    font-size: 11px;
+    line-height: 17px;
+    color: #5c6673;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .pl-item.active .pl-idx { color: var(--accent); }
+
+  .pl-body { flex: 1 1 auto; min-width: 0; }
+
+  .pl-name {
+    display: block;
+    font-size: 12.5px;
+    line-height: 17px;
+    color: var(--text);
+    /* 长文件名截断显示，完整名靠 title 属性悬停查看 */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .pl-item.active .pl-name { color: var(--accent); }
+
+  .pl-meta {
+    display: block;
+    margin-top: 1px;
+    font-size: 11px;
+    line-height: 15px;
+    color: #6d7683;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .pl-badge {
+    display: inline-block;
+    margin-left: 5px;
+    padding: 0 4px;
+    border-radius: 3px;
+    background: rgba(248,113,113,.16);
+    color: #f87171;
+    font-size: 10px;
+    line-height: 15px;
+    vertical-align: 1px;
+  }
+
+  /* 搜索关键词高亮 */
+  .pl-name mark {
+    background: rgba(56,182,255,.3);
+    color: #fff;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+
+  .pl-empty {
+    padding: 28px 20px;
+    text-align: center;
+    font-size: 12px;
+    color: #6d7683;
+    line-height: 2;
+  }
+  .pl-empty b { color: var(--text-dim); font-weight: 500; }
+
+  /* ==================================================================
+     列表行尾的动作小图标（悬停 / 当前项浮现）
+     ================================================================== */
+  /* 为什么是绝对定位盖上去、而不是插进行内的流里：
+     插进流里的话，鼠标划过 → 图标出现 → 文件名被挤短 → 整行文字重排，
+     长列表看着就在抖。盖上去配一层同色渐变遮罩，行内内容一动不动。
+     行底色有四种（普通 / 悬停 / 当前项 / 当前项+悬停），
+     每种都要配一份对应的遮罩色，否则遮罩与行底色对不上一眼就能看出补丁。 */
+  .pl-act {
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding: 0 7px 0 18px;
+    background: linear-gradient(to right, rgba(22,25,30,0), #16191e 18px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .13s ease;
+  }
+  .pl-item:hover .pl-act,
+  .pl-item.active .pl-act {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .pl-item:hover .pl-act {
+    background: linear-gradient(to right, rgba(36,39,43,0), #24272b 18px);
+  }
+  .pl-item.active .pl-act {
+    background: linear-gradient(to right, rgba(26,45,59,0), #1a2d3b 18px);
+  }
+  .pl-item.active:hover .pl-act {
+    background: linear-gradient(to right, rgba(40,57,70,0), #283946 18px);
+  }
+
+  .pl-icon {
+    width: 23px; height: 23px;
+    display: flex; align-items: center; justify-content: center;
+    padding: 0;
+    border: 0; border-radius: 5px;
+    background: transparent;
+    color: #98a2af;
+    cursor: pointer;
+    transition: background .13s, color .13s;
+  }
+  .pl-icon svg { width: 14px; height: 14px; display: block; }
+  .pl-icon:hover { background: rgba(255,255,255,.16); color: #fff; }
+  .pl-icon.folder:hover { background: rgba(56,182,255,.85); color: #04121c; }
+  .pl-icon.danger:hover { background: rgba(198,54,54,.9);  color: #fff; }
+
+  /* ==================================================================
+     弹窗：帮助 / 文件信息 / 删除确认
+     ================================================================== */
+  #mask {
+    /* 用 fixed 而不是 absolute：fixed 是以视口为基准的，
+       文档被横向滚动时它一步都不动。
+       （absolute 会跟着文档一起偏 —— 之前 scrollIntoView 把 body.scrollLeft
+       顶成 320，弹窗就是这样被切掉左边的。根因已经在 scrollToCurrent 里修了，
+       这里是第二道保险：就算以后又有谁把文档顶偏，弹窗照样居中。） */
+    position: fixed; inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 30px;
+    /* 顶上压一层很淡的冷色辉光，比纯黑盖一层更有层次 */
+    background: radial-gradient(115% 95% at 50% -10%, rgba(24,44,62,.7), rgba(3,6,9,.87) 62%);
+    backdrop-filter: blur(3px);
+    z-index: 70;
+  }
+  #mask.show { display: flex; }
+
+  /* 弹窗开着的时候别让光标被 idle 隐掉（#app.idle 会把 cursor 设成 none） */
+  #app.modal-open { cursor: default; }
+
+  #modal {
+    width: 100%;
+    max-width: 640px;
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid #2e3641;
+    border-radius: 12px;
+    background: linear-gradient(180deg, #1a1e24, #141719);
+    box-shadow: 0 28px 70px rgba(0,0,0,.66), inset 0 1px 0 rgba(255,255,255,.055);
+    animation: mdIn .17s cubic-bezier(.2,.8,.3,1);
+  }
+  @keyframes mdIn {
+    from { opacity: 0; transform: translateY(12px) scale(.985); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  .md-head {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px 16px 13px 19px;
+    border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  /* 标题左侧一道竖条，和播放列表当前项的高亮是同一套语言 */
+  .md-head::before {
+    content: "";
+    position: absolute; left: 0; top: 15px; bottom: 15px;
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: linear-gradient(#8ad8ff, #38b6ff);
+  }
+  .md-title { font-size: 15px; font-weight: 500; }
+  .md-tag {
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(56,182,255,.14);
+    color: var(--accent);
+    font-size: 10.5px;
+  }
+  .md-spacer { flex: 1 1 auto; }
+  .md-x {
+    width: 26px; height: 26px;
+    border: 0; border-radius: 6px;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 14px; font-family: inherit; line-height: 1;
+    cursor: pointer;
+  }
+  .md-x:hover { background: rgba(255,255,255,.1); color: var(--text); }
+
+  .md-body { padding: 16px 19px 18px; overflow-y: auto; flex: 1 1 auto; }
+  .md-body::-webkit-scrollbar { width: 10px; }
+  .md-body::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,.16);
+    border-radius: 5px;
+    border: 2px solid #171a1f;
+  }
+
+  .md-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 9px;
+    padding: 12px 16px 14px;
+    border-top: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  .md-btn {
+    height: 33px;
+    padding: 0 17px;
+    border: 1px solid #333c48;
+    border-radius: 7px;
+    background: rgba(255,255,255,.06);
+    color: var(--text);
+    font-size: 13px; font-family: inherit;
+    cursor: pointer;
+    transition: background .14s, border-color .14s;
+  }
+  .md-btn:hover { background: rgba(255,255,255,.11); border-color: #43505f; }
+  .md-btn.danger {
+    border-color: rgba(255,120,120,.42);
+    background: rgba(186,52,52,.9);
+    color: #fff;
+  }
+  .md-btn.danger:hover { background: rgba(208,62,62,1); border-color: rgba(255,150,150,.6); }
+
+  /* --- 快捷键表 --- */
+  .hp-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 26px;
+  }
+  .hp-group { min-width: 0; padding-bottom: 6px; }
+  .hp-group h4 {
+    margin: 6px 0 6px;
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 1.6px;
+    color: var(--accent);
+  }
+  .hp-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 2.5px 0;
+    font-size: 12.5px;
+  }
+  /* 键帽右对齐成一列，扫一眼就能顺着看下来 */
+  .hp-k { flex: 0 0 104px; text-align: right; }
+  .hp-t { color: var(--text-dim); min-width: 0; }
+  .hp-plain { color: #7d8794; font-size: 12px; }
+  .hp-plus  { color: #5c6673; margin: 0 3px; }
+  kbd {
+    display: inline-block;
+    min-width: 19px;
+    padding: 1.5px 5.5px;
+    border: 1px solid #363f4b;
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    background: linear-gradient(#262c35, #1d2229);
+    /* 键帽用等宽字，看着才有「键盘」的味道 */
+    font-family: "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #e2e8ef;
+    white-space: nowrap;
+  }
+  .hp-note {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px dashed #2b323c;
+    font-size: 12px;
+    line-height: 1.85;
+    color: #7d8794;
+  }
+  .hp-note b { color: var(--text-dim); font-weight: 500; }
+
+  /* --- 文件信息 --- */
+  .if-row {
+    display: flex;
+    gap: 12px;
+    padding: 7px 0;
+    border-bottom: 1px solid rgba(255,255,255,.045);
+    font-size: 12.5px;
+  }
+  .if-row:last-child { border-bottom: 0; }
+  .if-k { flex: 0 0 84px; color: #7d8794; }
+  .if-v { flex: 1 1 auto; min-width: 0; word-break: break-all; line-height: 1.6; }
+  .if-v.mono {
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 12px;
+  }
+  .if-note {
+    margin: 10px 0 4px;
+    padding-top: 10px;
+    border-top: 1px dashed #2b323c;
+    font-size: 11.5px;
+    color: #7d8794;
+  }
+
+  /* --- 删除确认 --- */
+  .cf-name {
+    font-size: 14.5px;
+    line-height: 1.5;
+    word-break: break-all;
+  }
+  .cf-path {
+    margin-top: 6px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: #7d8794;
+    word-break: break-all;
+  }
+  .cf-warn {
+    margin-top: 14px;
+    padding: 9px 12px;
+    border-left: 3px solid #4a8ab5;
+    border-radius: 0 6px 6px 0;
+    background: rgba(56,182,255,.07);
+    font-size: 12px;
+    line-height: 1.7;
+    color: #9fb4c4;
+  }
+  .cf-warn b { color: var(--accent); font-weight: 500; }
+
+  /* 控制条上的播放列表开关按钮 */
+  #btnPlList.active {
+    color: var(--accent);
+    background: rgba(56,182,255,.13);
+  }
+
+  /* ============ 错误提示条 ============ */
+  #errBar {
+    position: absolute;
+    left: 50%; bottom: 96px;
+    transform: translateX(-50%);
+    max-width: 78%;
+    padding: 10px 16px;
+    border-radius: 8px;
+    background: rgba(160,40,40,.92);
+    border: 1px solid rgba(255,120,120,.5);
+    font-size: 13px;
+    line-height: 1.6;
+    color: #fff;
+    display: none;
+    z-index: 45;
+    text-align: center;
+  }
+  #errBar.show { display: block; }
+  #errBar b { font-weight: 500; }
+</style>
+</head>
+<body>
+
+<div id="app" class="no-file">
+
+  <!-- 播放舞台：video 始终存在，只是没源时不显示 -->
+  <div id="stage">
+    <div id="frame">
+      <video id="video" preload="metadata" playsinline></video>
+    </div>
+    <!-- 音频占位：mp3 / flac 这些没有画面，盖一张「正在播放」的卡片，
+         免得用户对着黑屏以为坏了。是否显示由 #app.audio-mode 控制 -->
+    <div id="audioFace" aria-hidden="true">
+      <div class="af-disc">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 17.5V5.6l9.6-2v11.9"/>
+          <ellipse cx="6.6" cy="17.6" rx="2.6" ry="2.2"/>
+          <ellipse cx="16.2" cy="15.5" rx="2.6" ry="2.2"/>
+        </svg>
+      </div>
+      <div class="af-name" id="afName"></div>
+      <div class="af-tag">音频</div>
+    </div>
+  </div>
+
+  <!-- 顶部：正在播放的文件名 -->
+  <div id="topbar">
+    <span class="fname"></span><span class="fmeta"></span>
+  </div>
+
+  <!-- 右上角关闭按钮：任何状态下都在，点一下直接关掉整个浏览器窗口 -->
+  <button id="winClose" title="关闭窗口" aria-label="关闭窗口">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+         stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+  </button>
+
+  <!-- 右上角帮助按钮：点开快捷键总表（键盘上按 ? 或 F1 也行） -->
+  <button id="helpBtn" title="快捷键一览（? 或 F1）" aria-label="快捷键一览">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+         stroke-linecap="round"><path d="M9.3 9.4a2.9 2.9 0 1 1 3.6 2.7c-.8.3-1.2.9-1.2 1.7v.4"/><path d="M11.7 17.6h.01"/></svg>
+  </button>
+
+  <!-- 空状态引导 -->
+  <div id="empty">
+    <div class="empty-icon">
+      <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+    </div>
+    <div class="empty-title">把视频 / 音频文件或整个文件夹拖到这里</div>
+    <div class="empty-sub">
+      松开鼠标立即播放 · 视频 mp4 / m4v / webm / mov · 音频 mp3 / flac / m4a<br>
+      拖入<b>文件夹</b>会自动扫出里面的全部视频和音频，生成播放列表
+    </div>
+    <button class="pick-btn" id="pickBtn">或点这里选择文件（可多选）</button>
+    <div class="empty-keys">
+      <b>← →</b> 前后 5 秒 &nbsp;·&nbsp; <b>Ctrl + ← →</b> 前后 60 秒<br>
+      <b>空格</b> 播放 / 暂停 &nbsp;·&nbsp; <b>回车</b> 窗口 / 全屏<br>
+      <b>+ -</b> 加速 / 减速 &nbsp;·&nbsp; <b>0</b> 恢复原始速度<br>
+      <b>[ ]</b> 画面左转 / 右转 90° &nbsp;·&nbsp; <b>R</b> 画面复位<br>
+      <b>F D</b> 逐帧前进 / 后退 &nbsp;·&nbsp; <b>滚轮</b> 按鼠标位置放大缩小<br>
+      <b>N P</b> / <b>PgUp PgDn</b> 上一个 / 下一个 &nbsp;·&nbsp; <b>Home End</b> 第一个 / 最后一个<br>
+      <b>L</b> 展开播放列表 &nbsp;·&nbsp; <b>DEL</b> 删除当前文件（进回收站）<br>
+      右上角 <b>×</b> 关闭窗口 &nbsp;·&nbsp; <b>?</b> 查看全部快捷键
+    </div>
+  </div>
+
+  <!-- 拖放高亮层 -->
+  <div id="dropMask">松开鼠标即可播放（支持整个文件夹）</div>
+
+  <!-- 错误提示条 -->
+  <div id="errBar"></div>
+
+  <!-- 操作反馈浮字 -->
+  <div id="toast"></div>
+
+  <!-- 弹窗层：快捷键表 / 文件信息 / 删除确认共用一个壳。
+       点遮罩空白处或按 Esc 关闭。z-index 70，盖过面板（30）与关闭按钮（60） -->
+  <div id="mask"><div id="modal"></div></div>
+
+  <!-- 底部控制条 -->
+  <div id="controls">
+
+    <div class="row-progress">
+      <span class="time" id="timeNow">00:00</span>
+      <input type="range" id="progress" min="0" max="1000" step="1" value="0"
+             tabindex="-1" aria-label="播放进度">
+      <span class="time" id="timeAll">00:00</span>
+    </div>
+
+    <div class="row-buttons">
+      <button class="btn icon primary" id="btnPlay" title="播放 / 暂停（空格）">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+
+      <button class="btn icon" id="btnBack60" title="后退 60 秒（Ctrl + ←）">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/></svg>
+      </button>
+
+      <button class="btn icon" id="btnFwd60" title="前进 60 秒（Ctrl + →）">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 6v12l8.5-6L13 6zM4 18l8.5-6L4 6v12z"/></svg>
+      </button>
+
+      <!-- 播放速度：点击按钮可直接恢复原始速度 -->
+      <button class="btn" id="btnSpeed" title="播放速度（+ 加速 / - 减速 / 0 恢复原速，点击按钮也可恢复）">1.0x</button>
+
+      <!-- 画面旋转：每次 90°，画面非回正状态时两个按钮一起高亮 -->
+      <button class="btn icon" id="btnRotL" title="画面左转 90°（[ 键）">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7.11 8.53L5.7 7.11C4.8 8.27 4.24 9.61 4.07 11h2.02c.14-.87.49-1.72 1.02-2.47zM6.09 13H4.07c.17 1.39.72 2.73 1.62 3.89l1.41-1.42c-.52-.75-.87-1.59-1.01-2.47zm1.01 5.32c1.16.9 2.51 1.44 3.9 1.61V17.9c-.87-.15-1.71-.49-2.46-1.03L7.1 18.32zM13 4.07V1L8.45 5.55 13 10V6.09c2.84.48 5 2.94 5 5.91s-2.16 5.43-5 5.91v2.02c3.95-.49 7-3.85 7-7.93s-3.05-7.44-7-7.93z"/></svg>
+      </button>
+
+      <button class="btn icon" id="btnRotR" title="画面右转 90°（] 键，R 键回正）">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.55 5.55L11 1v3.07C7.06 4.56 4 7.92 4 12s3.05 7.44 7 7.93v-2.02c-2.84-.48-5-2.94-5-5.91s2.16-5.43 5-5.91V10l4.55-4.45zM19.93 11c-.17-1.39-.72-2.73-1.62-3.89l-1.42 1.42c.54.75.88 1.6 1.02 2.47h2.02zM13 17.9v2.02c1.39-.17 2.74-.71 3.9-1.61l-1.44-1.44c-.75.54-1.59.89-2.46 1.03zm3.89-2.42l1.42 1.41c.9-1.16 1.45-2.5 1.62-3.89h-2.02c-.14.87-.48 1.72-1.02 2.48z"/></svg>
+      </button>
+
+      <span class="spacer"></span>
+
+      <span class="label-mini">比例</span>
+      <span class="select-wrap">
+        <select id="selRatio" title="播放比例"></select>
+      </span>
+
+      <span class="select-wrap">
+        <select id="selFit" title="画面填充方式">
+          <option value="contain">留黑边</option>
+          <option value="cover">裁剪铺满</option>
+          <option value="fill">拉伸铺满</option>
+        </select>
+      </span>
+
+      <span class="spacer"></span>
+
+      <button class="btn icon" id="btnMute" title="静音（M）">
+        <svg viewBox="0 0 24 24" fill="currentColor" id="muteIcon"><path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2c0-1.8-1-3.3-2.5-4v8c1.5-.7 2.5-2.2 2.5-4zM14 3.2v2.1c2.9.9 5 3.6 5 6.7s-2.1 5.8-5 6.7v2.1c4-1 7-4.6 7-8.8s-3-7.8-7-8.8z"/></svg>
+      </button>
+      <input type="range" id="volume" min="0" max="100" step="1" value="100"
+             tabindex="-1" aria-label="音量">
+      <span class="vol-pct" id="volPct">100%</span>
+
+      <!-- 播放列表开关：展开 / 收起右侧面板 -->
+      <button class="btn icon" id="btnPlList" title="播放列表（L）">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 10h11v2H3zm0-4h11v2H3zm0 8h7v2H3zm13-1v6l5-3z"/></svg>
+      </button>
+
+      <button class="btn icon" id="btnFull" title="窗口 / 全屏（回车）">
+        <svg viewBox="0 0 24 24" fill="currentColor" id="fullIcon"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+      </button>
+    </div>
+
+  </div>
+
+  <!-- 播放列表面板（可收缩，收起时滑出屏幕右侧） -->
+  <aside id="playlist">
+    <div class="pl-head">
+      <span class="pl-title">播放列表</span>
+      <span class="pl-count" id="plCount">0</span>
+      <span class="pl-spacer"></span>
+      <button class="pl-x" id="plClose" title="收起列表（L）">✕</button>
+    </div>
+
+    <div class="pl-tools">
+      <div class="pl-search-wrap">
+        <input type="text" id="plSearch" placeholder="搜索文件名（空格分词）"
+               autocomplete="off" spellcheck="false">
+        <button id="plSearchClear" title="清空搜索">✕</button>
+      </div>
+      <div class="pl-sortrow">
+        <select id="plSort" title="排序方式"></select>
+        <button id="plOrder" title="切换正序 / 倒序">↓</button>
+      </div>
+    </div>
+
+    <div class="pl-list" id="plList"></div>
+  </aside>
+
+</div>
+
+<input type="file" id="fileInput" accept="video/*,.mp4,.m4v,.webm,.mov,.ogv" multiple hidden>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ==================================================================
+     一、元素引用
+     ================================================================== */
+  var app       = document.getElementById('app');
+  var stage     = document.getElementById('stage');
+  var frame     = document.getElementById('frame');
+  var video     = document.getElementById('video');
+  var afName    = document.getElementById('afName');   // 音频占位里的文件名
+  var emptyBox  = document.getElementById('empty');
+  var dropMask  = document.getElementById('dropMask');
+  var topbar    = document.getElementById('topbar');
+  var fnameEl   = topbar.querySelector('.fname');
+  var fmetaEl   = topbar.querySelector('.fmeta');
+  var winClose  = document.getElementById('winClose');
+  var progress  = document.getElementById('progress');
+  var timeNow   = document.getElementById('timeNow');
+  var timeAll   = document.getElementById('timeAll');
+  var volSlider = document.getElementById('volume');
+  var volPct    = document.getElementById('volPct');
+  var btnPlay   = document.getElementById('btnPlay');
+  var btnMute   = document.getElementById('btnMute');
+  var btnFull   = document.getElementById('btnFull');
+  var muteIcon  = document.getElementById('muteIcon');
+  var fullIcon  = document.getElementById('fullIcon');
+  var selRatio  = document.getElementById('selRatio');
+  var selFit    = document.getElementById('selFit');
+  var btnSpeed  = document.getElementById('btnSpeed');
+  var btnRotL   = document.getElementById('btnRotL');
+  var btnRotR   = document.getElementById('btnRotR');
+  var toastEl   = document.getElementById('toast');
+  var errBar    = document.getElementById('errBar');
+  var fileInput = document.getElementById('fileInput');
+
+  // 播放列表面板相关
+  var plPanel   = document.getElementById('playlist');
+  var plListEl  = document.getElementById('plList');
+  var plCountEl = document.getElementById('plCount');
+  var plSearch  = document.getElementById('plSearch');
+  var plClear   = document.getElementById('plSearchClear');
+  var plSort    = document.getElementById('plSort');
+  var plOrder   = document.getElementById('plOrder');
+  var btnPlList = document.getElementById('btnPlList');
+
+  /* ==================================================================
+     二、常量与状态
+     ================================================================== */
+
+  // 常见播放比例。w/h 为 0 表示「原始比例」（不强制，铺满舞台交由 object-fit 处理）
+  var RATIO_PRESETS = [
+    { id: 'original', label: '原始比例',  w: 0,  h: 0  },
+    { id: '16-9',     label: '16 : 9',    w: 16, h: 9  },
+    { id: '4-3',      label: '4 : 3',     w: 4,  h: 3  },
+    { id: '21-9',     label: '21 : 9',    w: 21, h: 9  },
+    { id: '3-2',      label: '3 : 2',     w: 3,  h: 2  },
+    { id: '1-1',      label: '1 : 1',     w: 1,  h: 1  },
+    { id: '9-16',     label: '9 : 16 竖屏', w: 9, h: 16 }
+  ];
+
+  // 播放速度档位表。
+  // 2.0 倍以内按 0.25 步进（便于细调听不清的台词），
+  // 之后按 0.5 步进到 4.0（高速区间不需要那么细）。
+  var SPEED_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4];
+
+  // 画面缩放的上下限。
+  // 下限取 1（原始大小）而不是更小：缩到 1 以下画面会比视频框还小、四周露黑边，
+  // 看着像播放器坏了 —— 这里的「缩小」指的是把放大过的画面收回来。
+  var ZOOM_MIN  = 1;
+  var ZOOM_MAX  = 8;
+  var ZOOM_STEP = 1.15;   // 滚轮每格变化的倍数，连滚手感接近「一档一档」
+
+  // 逐帧步进用的兜底帧长。
+  // 浏览器不提供「这个视频多少 fps」的接口，所以正常走实测（见 startFrameGapProbe），
+  // 只有「一次都没播放过」时才退回这个最常见的 30fps 值。
+  var FRAME_GAP_FALLBACK = 1 / 30;
+  var FRAME_GAP_SAMPLES  = 12;   // 采够这么多个有效样本就停掉采样回调，不长期占性能
+
+  // 浏览器内核（Chromium）能直接解码的扩展名。
+  // 视频在前、音频在后 —— 音频用同一个 <video> 元素播（HTML5 里 video 元素
+  // 本来就能放纯音频流，只是没有画面），所以只需要把扩展名纳进白名单。
+  var EXT_PLAYABLE = ['mp4', 'm4v', 'webm', 'mov', 'ogv',
+                      'mp3', 'm4a', 'm4b', 'aac', 'wav', 'flac',
+                      'ogg', 'oga', 'opus', 'weba'];
+
+  // 纯音频扩展名 —— 单独拎出来只为一件事：界面知道该不该显示「音频占位」。
+  // 没有画面时 <video> 画出来是一整块黑，用户会以为播放器坏了。
+  // 注意 ogg 按音频算（视频的 Ogg 用 .ogv 那个扩展名）。
+  var EXT_AUDIO = ['mp3', 'm4a', 'm4b', 'aac', 'wav', 'flac',
+                   'ogg', 'oga', 'opus', 'weba'];
+
+  // 常见但 Chromium 无法解析的容器，拖入时给出明确指引而不是黑屏。
+  // 音频里 wma / ape / aiff / amr / mka / mid / ac3 / dts 这些内核都不认，
+  // 但用户在文件夹里确实会看到它们，所以一并收进来置灰。
+  var EXT_UNSUPPORTED = ['mkv', 'avi', 'rmvb', 'rm', 'wmv', 'flv',
+                         'ts', 'm2ts', 'vob', '3gp', 'f4v', 'asf',
+                         'mpg', 'mpeg', 'divx', 'xvid', 'swf',
+                         'wma', 'ape', 'aiff', 'aif', 'amr', 'mka', 'mid',
+                         'ac3', 'dts'];
+
+  // 会被收进播放列表的扩展名 = 内核能播的 + 常见但内核不支持的。
+  // 不支持的一并收进来并置灰，让用户看得见「文件确实在这个文件夹、只是播不了」，
+  // 这比直接隐藏更不容易让人困惑。
+  var EXT_MEDIA = EXT_PLAYABLE.concat(EXT_UNSUPPORTED);
+
+  // 播放列表可选的排序维度。默认按下标 0（时间）倒序，即「新的在前」
+  var SORT_FIELDS = [
+    { id: 'time', label: '按时间' },
+    { id: 'name', label: '按文件名' },
+    { id: 'size', label: '按文件大小' },
+    { id: 'type', label: '按文件类型' }
+  ];
+
+  // video 错误码对应的中文说明
+  var MEDIA_ERR_TEXT = {
+    1: '播放被中断',
+    2: '读取文件时出错',
+    3: '视频解码失败，文件可能已损坏',
+    4: '当前浏览器内核不支持该视频的编码格式'
+  };
+
+  var currentUrl   = null;    // 当前 blob URL，切换时必须 revoke 否则内存累积
+  var currentRatio = RATIO_PRESETS[0];  // 当前比例
+  var isSeeking    = false;   // 用户是否正在拖动进度条
+  var dragDepth    = 0;       // 拖入计数（子元素会反复触发 dragenter/leave，需计数）
+  var hideTimer    = null;    // 控制条自动隐藏定时器
+  var toastTimer   = null;    // 操作提示浮字定时器
+  // （原「音量落盘节流定时器 volSaveTimer」已移除：音量不再记忆，所以没有落盘动作了）
+  var speedIndex   = SPEED_STEPS.indexOf(1);  // 当前速度在档位表中的下标，默认指向 1 倍速
+  var rotation     = 0;       // 画面旋转角度，只取 0 / 90 / 180 / 270 四个值
+  // ---- 画面缩放状态（滚轮缩放）----
+  var zoom         = 1;       // 缩放倍数，1 = 原始大小（视频框里铺满的状态）
+  var zoomX        = 0;       // 锚点补偿平移量（像素，屏幕方向），见 zoomAt()
+  var zoomY        = 0;
+  // ---- 逐帧步进用的帧长采样状态 ----
+  var frameGap     = 0;       // 实测帧长（秒），0 = 还没测到，走 FRAME_GAP_FALLBACK
+  var frameGapHits = 0;       // 已采到的有效样本数
+  var lastMediaTime  = 0;     // 上一次回调的媒体时间
+  var lastFrameCount = 0;     // 上一次回调的累计呈现帧数
+  var frameProbeId   = 0;     // 采样「代次」：换片后旧回调凭它认出自己已作废，自行退场
+
+  // ---- 播放列表状态 ----
+  var playlist     = [];      // 列表数据，每项见 makeItem() 的字段说明
+  var plIndex      = -1;      // 当前播放项在 playlist 中的下标，-1 表示还没选中任何项
+  var plVisible    = [];      // 搜索过滤后的下标序列（连播按这个顺序走，不是全量顺序）
+  var plOpen       = false;   // 面板是否处于展开状态
+  var plQuery      = '';      // 搜索关键词原文
+  var plSortField  = 'time';  // 当前排序字段
+  var plSortAsc    = false;   // 是否正序；默认 false = 倒序（时间从新到旧）
+
+  /* ==================================================================
+     三、小工具
+     ================================================================== */
+
+  // 操作反馈浮字
+  function showToast(text) {
+    toastEl.textContent = text;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      toastEl.classList.remove('show');
+    }, 850);
+  }
+
+  // 错误提示条（常驻直到下次成功播放）
+  function showError(text) {
+    errBar.innerHTML = text;
+    errBar.classList.add('show');
+    console.log('[冰冰播放器] 出错提示：' + text);
+  }
+
+  function clearError() {
+    errBar.classList.remove('show');
+    errBar.textContent = '';
+  }
+
+  // 秒 → mm:ss / hh:mm:ss
+  function fmtTime(sec) {
+    if (!isFinite(sec) || sec < 0) { return '00:00'; }
+    var s = Math.floor(sec);
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var ss = s % 60;
+    var pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+    if (h > 0) { return h + ':' + pad(m) + ':' + pad(ss); }
+    return pad(m) + ':' + pad(ss);
+  }
+
+  // 秒 → mm:ss.mmm。
+  // 逐帧步进一次只挪几十毫秒，只用 fmtTime 看不出有没有真的动了，所以补一个到毫秒的格式
+  function fmtTimeMs(sec) {
+    if (!isFinite(sec) || sec < 0) { sec = 0; }
+    var ms = Math.round((sec - Math.floor(sec)) * 1000);
+    // 进位到 1000 时压回 999，否则会出现 "00:12.1000" 这种看着像进位错了的写法
+    if (ms >= 1000) { ms = 999; }
+    return fmtTime(sec) + '.' + ('00' + ms).slice(-3);
+  }
+
+  // 文件大小 → 可读文本
+  function fmtSize(bytes) {
+    if (!bytes) { return ''; }
+    var kb = bytes / 1024;
+    if (kb < 1024) { return kb.toFixed(0) + ' KB'; }
+    var mb = kb / 1024;
+    if (mb < 1024) { return mb.toFixed(1) + ' MB'; }
+    return (mb / 1024).toFixed(2) + ' GB';
+  }
+
+  // 播放倍率 → 显示文本：0.25 → "0.25x"、1 → "1.0x"、1.5 → "1.5x"、2 → "2.0x"
+  function fmtRate(rate) {
+    // 先固定两位小数，再把末尾多余的 0 去掉，但至少保留一位小数
+    var s = rate.toFixed(2);
+    if (s.charAt(s.length - 1) === '0') { s = s.slice(0, -1); }
+    return s + 'x';
+  }
+
+  // 取扩展名（小写，不含点）
+  function extOf(name) {
+    var i = name.lastIndexOf('.');
+    if (i < 0) { return ''; }
+    return name.slice(i + 1).toLowerCase();
+  }
+
+  // 毫秒时间戳 → 显示文本。
+  // 今年的文件只显示 MM-DD HH:mm（列表里更紧凑），
+  // 跨年的补上年份，避免把去年的片子误认成今年的
+  function fmtDate(ms) {
+    if (!ms) { return ''; }
+    var d = new Date(ms);
+    if (isNaN(d.getTime())) { return ''; }
+    var pad = function (n) { return n < 10 ? '0' + n : '' + n; };
+    var ymd;
+    if (d.getFullYear() === new Date().getFullYear()) {
+      ymd = pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    } else {
+      ymd = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    }
+    return ymd + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  // HTML 转义。
+  // 文件名来自本地磁盘，完全可能包含 < > & " 这类字符，
+  // 直接拼进 innerHTML 会破坏列表结构、极端情况下还能注入脚本，必须转义。
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // 搜索匹配：按空格分词，要求全部命中（AND 关系），不区分大小写
+  function matchKeywords(name, keywords) {
+    if (keywords.length === 0) { return true; }
+    var lower = name.toLowerCase();
+    for (var i = 0; i < keywords.length; i++) {
+      if (lower.indexOf(keywords[i]) < 0) { return false; }
+    }
+    return true;
+  }
+
+  // 把命中的关键词用 <mark> 包起来。
+  // 做法是「在原文上找位置 → 分段转义后再插标记」，
+  // 不能先转义再替换：转义后插入的 <mark> 里含英文字母，
+  // 会被后续关键词再次命中，标签就被打碎了
+  function highlightName(name, keywords) {
+    if (!keywords || keywords.length === 0) { return escHtml(name); }
+
+    // 关键词里的正则元字符要先转义，否则 . * + 之类会被当成语法
+    var parts = [];
+    for (var i = 0; i < keywords.length; i++) {
+      parts.push(keywords[i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    }
+    var re = new RegExp('(' + parts.join('|') + ')', 'gi');
+
+    var src = String(name);
+    var out = '';
+    var last = 0;
+    var m = re.exec(src);
+    while (m !== null) {
+      out += escHtml(src.slice(last, m.index));
+      out += '<mark>' + escHtml(m[0]) + '</mark>';
+      last = m.index + m[0].length;
+      // 防御零长度匹配（关键词意外为空时）导致死循环
+      if (m[0].length === 0) { re.lastIndex++; }
+      m = re.exec(src);
+    }
+    out += escHtml(src.slice(last));
+    return out;
+  }
+
+  // 把搜索词拆成关键词数组（去掉空串）
+  function splitKeywords(query) {
+    var out = [];
+    if (!query) { return out; }
+    var raw = query.toLowerCase().split(/\s+/);
+    for (var i = 0; i < raw.length; i++) {
+      if (raw[i]) { out.push(raw[i]); }
+    }
+    return out;
+  }
+
+  // 设置 range 的已填充比例（供 CSS 渐变使用）
+  function setRangeFill(el, percent) {
+    el.style.setProperty('--filled', percent + '%');
+  }
+
+  /* ==================================================================
+     四、比例与画面尺寸
+     ================================================================== */
+
+  // 初始化比例下拉框
+  function buildRatioOptions() {
+    for (var i = 0; i < RATIO_PRESETS.length; i++) {
+      var p = RATIO_PRESETS[i];
+      var opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.label;
+      selRatio.appendChild(opt);
+    }
+    selRatio.value = RATIO_PRESETS[0].id;
+  }
+
+  // 把「旋转 + 缩放」一起套用到视频元素上 —— 这是画面几何状态的唯一出口，
+  // 任何改 rotation / zoom / zoomX / zoomY 的地方都必须回来调它一次。
+  //
+  // transform 的书写顺序不能乱：
+  //   1. translate(-50%, -50%)   把元素居中。百分比按元素自身宽高算，
+  //                              而 left/top 是 50%，所以元素中心永远落在视频框中心
+  //   2. translate(zoomX, zoomY) 缩放锚点的补偿平移。它写在 rotate 前面，
+  //                              意味着在「没旋转的坐标系」里做 —— 等价于屏幕方向平移，
+  //                              这正是光标锚点能对准的原因（转 90° 后写成后面就跑偏了）
+  //   3. rotate(rotation)        旋转（跟着元素中心转，中心不动）
+  //   4. scale(zoom)             缩放（同样绕元素中心）
+  //
+  // 另外：转 90° / 270° 时必须把视频元素的宽高互换，
+  // 否则旋转后画面会超出视频框被裁掉（video 原本是 100% 铺满的）。
+  function applyView() {
+    var fw = frame.clientWidth;
+    var fh = frame.clientHeight;
+
+    // 角度、缩放与按钮状态任何时候都要同步，不受尺寸是否就绪影响
+    video.style.transform = 'translate(-50%, -50%) translate(' + zoomX + 'px, ' + zoomY + 'px)'
+                          + ' rotate(' + rotation + 'deg) scale(' + zoom + ')';
+
+    // 非回正状态时两个旋转按钮一起高亮，一眼看出画面被转过
+    if (rotation === 0) {
+      btnRotL.classList.remove('active');
+      btnRotR.classList.remove('active');
+    } else {
+      btnRotL.classList.add('active');
+      btnRotR.classList.add('active');
+    }
+
+    // 尺寸尚未测量到时跳过尺寸设置（否则会把视频压成 0 宽），
+    // 等下一次 layoutFrame 触发时再补上互换后的宽高
+    if (fw <= 0 || fh <= 0) { return; }
+
+    if (rotation === 90 || rotation === 270) {
+      // 宽高互换，转完正好填回视频框原来的区域
+      video.style.width  = fh + 'px';
+      video.style.height = fw + 'px';
+    } else {
+      // 0° / 180° 宽高不变，交回百分比让 CSS 处理
+      video.style.width  = '100%';
+      video.style.height = '100%';
+    }
+  }
+
+  // 按所选比例计算视频框尺寸：在舞台内取最大的等比例矩形
+  function layoutFrame() {
+    var sw = stage.clientWidth;
+    var sh = stage.clientHeight;
+    if (sw <= 0 || sh <= 0) { return; }
+
+    // 原始比例：视频框铺满整个舞台，画面怎么摆交给 object-fit
+    if (!currentRatio || currentRatio.w === 0) {
+      frame.style.width  = sw + 'px';
+      frame.style.height = sh + 'px';
+    } else {
+      var targetRatio = currentRatio.w / currentRatio.h;
+      var stageRatio  = sw / sh;
+      var w, h;
+
+      if (stageRatio > targetRatio) {
+        // 舞台比目标比例更宽 → 高度受限，两侧留黑边
+        h = sh;
+        w = h * targetRatio;
+      } else {
+        // 舞台比目标比例更窄 → 宽度受限，上下留黑边
+        w = sw;
+        h = w / targetRatio;
+      }
+
+      frame.style.width  = Math.round(w) + 'px';
+      frame.style.height = Math.round(h) + 'px';
+    }
+
+    // 视频框尺寸变了，旋转后的视频尺寸依赖它，必须重新套用一次
+    applyView();
+  }
+
+  /* ==================================================================
+     五、载入与播放
+     ================================================================== */
+
+  // 说明：原有的 pickVideoFile() 已移除。
+  // 现在由 handleDrop() / loadFilesToList() 统一处理「一批文件里哪些是媒体文件」，
+  // 不再只挑出第一个 —— 拖入多个文件或整个文件夹时它们会全部进列表。
+
+  // 载入并播放一个本地视频文件。
+  // 内部统一走「播放列表」通路 —— 单个文件也就是只有一项的列表，
+  // 这样连播 / 切换 / 高亮只有一套逻辑，不必维护两条平行的代码路径
+  function loadFile(file) {
+    if (!file) { return; }
+    console.log('[冰冰播放器] 载入文件：' + file.name +
+                ' | 扩展名：' + extOf(file.name) +
+                ' | 大小：' + fmtSize(file.size) +
+                ' | MIME：' + (file.type || '未知'));
+    loadFilesToList([file]);
+  }
+
+  // 快进 / 快退
+  function seekBy(delta) {
+    if (!video.src || !isFinite(video.duration)) { return; }
+    var t = video.currentTime + delta;
+    if (t < 0) { t = 0; }
+    if (t > video.duration) { t = video.duration; }
+    video.currentTime = t;
+    showToast((delta > 0 ? '快进 ' : '快退 ') + Math.abs(delta) + ' 秒');
+  }
+
+  /* ==================================================================
+     五点五、播放速度调节
+     ================================================================== */
+
+  // 把当前档位应用到 video，并同步按钮文字与高亮状态
+  function applySpeed() {
+    var rate = SPEED_STEPS[speedIndex];
+    video.playbackRate = rate;
+    btnSpeed.textContent = fmtRate(rate);
+    // 非原速时按钮高亮，方便一眼看出当前不在 1.0x
+    if (rate === 1) {
+      btnSpeed.classList.remove('active');
+    } else {
+      btnSpeed.classList.add('active');
+    }
+    console.log('[冰冰播放器] 播放速度：' + fmtRate(rate));
+  }
+
+  // 加速（已到最快档时给出提示，不越界）
+  function speedUp() {
+    if (speedIndex >= SPEED_STEPS.length - 1) {
+      showToast('已经是最快 ' + fmtRate(SPEED_STEPS[speedIndex]));
+      return;
+    }
+    speedIndex++;
+    applySpeed();
+    showToast('播放速度 ' + fmtRate(SPEED_STEPS[speedIndex]));
+    wakeControls();
+  }
+
+  // 减速（已到最慢档时给出提示，不越界）
+  function speedDown() {
+    if (speedIndex <= 0) {
+      showToast('已经是最慢 ' + fmtRate(SPEED_STEPS[speedIndex]));
+      return;
+    }
+    speedIndex--;
+    applySpeed();
+    showToast('播放速度 ' + fmtRate(SPEED_STEPS[speedIndex]));
+    wakeControls();
+  }
+
+  // 恢复原始速度（1 倍速）
+  function speedReset() {
+    speedIndex = SPEED_STEPS.indexOf(1);
+    applySpeed();
+    showToast('播放速度 1.0x（原始）');
+    wakeControls();
+  }
+
+  /* ==================================================================
+     五点六、画面旋转
+     ================================================================== */
+
+  // 旋转角度 → 提示文字
+  function rotateTip() {
+    if (rotation === 0) { return '画面已回正'; }
+    if (rotation === 180) { return '画面已翻转 180°'; }
+    return '画面已旋转 ' + rotation + '°';
+  }
+
+  // 左转 90°（逆时针）
+  function rotateLeft() {
+    // 加 270 再取模，等价于减 90，但不会出现负数
+    rotation = (rotation + 270) % 360;
+    applyView();
+    showToast(rotateTip());
+    wakeControls();
+    console.log('[冰冰播放器] 画面旋转：' + rotation + '°');
+  }
+
+  // 右转 90°（顺时针）
+  function rotateRight() {
+    rotation = (rotation + 90) % 360;
+    applyView();
+    showToast(rotateTip());
+    wakeControls();
+    console.log('[冰冰播放器] 画面旋转：' + rotation + '°');
+  }
+
+  // 画面复位：旋转回正 + 缩放收回到原始大小。
+  // 之所以把缩放一起收进来：R 键的定位就是「画面看着不对就按它」，
+  // 再多记一个「只收缩放」的键反而更难记。收回来的内容会如实写在提示里，不会悄悄动。
+  function viewReset() {
+    var hadRotate = rotation !== 0;
+    var hadZoom   = zoom !== ZOOM_MIN || zoomX !== 0 || zoomY !== 0;
+
+    if (!hadRotate && !hadZoom) {
+      showToast('画面本来就是原始状态');
+      return;
+    }
+
+    rotation = 0;
+    zoom     = ZOOM_MIN;
+    zoomX    = 0;
+    zoomY    = 0;
+    applyView();
+
+    // 如实说出收了哪几样，用户才知道刚才那一下动了什么
+    var done = [];
+    if (hadRotate) { done.push('旋转'); }
+    if (hadZoom)   { done.push('缩放'); }
+    showToast('画面已复位（' + done.join(' + ') + '）');
+    wakeControls();
+    console.log('[冰冰播放器] 画面复位 | 旋转 0° | 缩放 1.00 倍');
+  }
+
+  /* ==================================================================
+     五点七、滚轮缩放（锚点是鼠标位置）
+     ================================================================== */
+
+  // 缩放到指定倍数，并让「鼠标指着的那一点」停在原地。
+  //
+  // 锚点算法（全程在屏幕坐标系里算，跟旋转角度无关，所以画面转过 90° 也照样准）：
+  //   视频元素永远绕自身中心缩放，而它的中心恒等于视频框的中心 C
+  //   （transform 开头的 translate(-50%,-50%) 保证这一点，后面的旋转/缩放都不会挪动它）。
+  //   设光标相对 C 的向量为 v，倍数从 z 变到 z' 时，
+  //   光标底下那个像素点会跑到 C + (z'/z)·v，补一个平移把差值抵消即可：
+  //       X' = (1 - k)·v + k·X        （k = z'/z，X 是上一次累积的平移）
+  function zoomAt(next, clientX, clientY) {
+    if (next < ZOOM_MIN) { next = ZOOM_MIN; }
+    if (next > ZOOM_MAX) { next = ZOOM_MAX; }
+    if (next === zoom) { return; }
+
+    var box = frame.getBoundingClientRect();
+    var cx = box.left + box.width / 2;
+    var cy = box.top + box.height / 2;
+    var k = next / zoom;
+
+    zoomX = (1 - k) * (clientX - cx) + k * zoomX;
+    zoomY = (1 - k) * (clientY - cy) + k * zoomY;
+    zoom  = next;
+
+    // 收回原始大小时把平移一起归零：
+    // 否则浮点累积的零点几像素会让画面在 1 倍时略微偏出中心
+    if (zoom === ZOOM_MIN) { zoomX = 0; zoomY = 0; }
+
+    applyView();
+    showToast('画面缩放 ' + Math.round(zoom * 100) + '%');
+    console.log('[冰冰播放器] 画面缩放：' + zoom.toFixed(2) + ' 倍 | 锚点补偿 ' +
+                Math.round(zoomX) + ', ' + Math.round(zoomY));
+  }
+
+  // 缩放复位（换片时自动调用）
+  function resetZoom() {
+    if (zoom === ZOOM_MIN && zoomX === 0 && zoomY === 0) { return; }
+    zoom  = ZOOM_MIN;
+    zoomX = 0;
+    zoomY = 0;
+    applyView();
+    console.log('[冰冰播放器] 画面缩放已复位');
+  }
+
+  /* ==================================================================
+     五点八、逐帧步进（F 前进 / D 后退）
+     ================================================================== */
+
+  // 一帧有多长？浏览器没有「这个视频多少 fps」的接口，所以在播放中实测：
+  //   两次 requestVideoFrameCallback 之间，
+  //   mediaTime（当前呈现帧的媒体时间）的差 ÷ presentedFrames（累计呈现帧数）的差
+  //   = 一帧占多少秒。
+  // 这样 25fps 的片子按 F 就是精确一帧，不会固定按 1/30 秒去走偏。
+  // 采够 FRAME_GAP_SAMPLES 个有效样本就不再续订回调，回调链自然结束，不长期占性能。
+  //
+  // 采样靠 frameProbeId 分「代次」：换片时会重新起一代，
+  // 上一代残留的那次回调一看代次不对就自己退场 ——
+  // 否则两条回调链会同时读写 lastMediaTime / lastFrameCount，
+  // 算出来的帧长会偏，甚至偏成一半。
+  function startFrameGapProbe() {
+    frameGap       = 0;
+    frameGapHits   = 0;
+    lastMediaTime  = 0;
+    lastFrameCount = 0;
+    frameProbeId++;
+
+    if (!video.requestVideoFrameCallback) {
+      console.log('[冰冰播放器] 内核不支持 requestVideoFrameCallback，逐帧按 1/30 秒估算');
+      return;
+    }
+    registerFrameProbe(frameProbeId);
+  }
+
+  // 注册下一代采样回调。用一层包装把「代次」带进去（回调本身只收到 now / meta）
+  function registerFrameProbe(myId) {
+    video.requestVideoFrameCallback(function (now, meta) {
+      probeFrameGap(myId, now, meta);
+    });
+  }
+
+  // 单次采样。只有播放中才会被调到（暂停时没有新帧，不会有回调）
+  function probeFrameGap(myId, now, meta) {
+    // 已经换片，这一代作废
+    if (myId !== frameProbeId) { return; }
+
+    if (lastFrameCount > 0) {
+      var dFrames = meta.presentedFrames - lastFrameCount;
+      var dTime   = meta.mediaTime - lastMediaTime;
+      // 两道护栏：
+      //   dFrames > 0     —— 起播、seek 之后会出现帧数不涨的回调，那种算不出帧长
+      //   0.001~1 秒/帧   —— 排除起播抖动、卡顿造成的离谱值（1~1000 fps 之外的一律不采信）
+      if (dFrames > 0 && dTime > 0.001 * dFrames && dTime < 1 * dFrames) {
+        frameGap = dTime / dFrames;
+        frameGapHits++;
+      }
+    }
+    lastMediaTime  = meta.mediaTime;
+    lastFrameCount = meta.presentedFrames;
+
+    if (frameGapHits >= FRAME_GAP_SAMPLES) {
+      console.log('[冰冰播放器] 实测帧长 ' + frameGap.toFixed(4) + ' 秒（约 ' +
+                  Math.round(1 / frameGap) + ' fps）');
+      return;
+    }
+    registerFrameProbe(myId);
+  }
+
+  // 逐帧步进。dir = +1 下一帧，-1 上一帧
+  //
+  // 必须先暂停：播放状态下挪 currentTime 会被紧接着呈现的下一帧立刻覆盖，肉眼看不到效果。
+  // 另外浏览器没有「跳到下一帧」这种 API，只能按帧长挪 —— 所以帧长准不准直接决定这一步准不准。
+  function stepFrame(dir) {
+    if (!video.src || !isFinite(video.duration)) { return; }
+    if (!video.paused) { video.pause(); }
+
+    var gap = frameGap > 0 ? frameGap : FRAME_GAP_FALLBACK;
+    var t = video.currentTime + dir * gap;
+    if (t < 0) { t = 0; }
+    if (t > video.duration) { t = video.duration; }
+    video.currentTime = t;
+
+    showToast((dir > 0 ? '下一帧 ' : '上一帧 ') + fmtTimeMs(t));
+    wakeControls();
+    console.log('[冰冰播放器] 逐帧' + (dir > 0 ? '前进' : '后退') + ' | t=' + t.toFixed(3) +
+                ' 秒 | 帧长 ' + gap.toFixed(4) + ' 秒' +
+                (frameGap > 0 ? '（实测）' : '（1/30 估算）'));
+  }
+
+  /* ==================================================================
+     五点九、播放列表
+     ================================================================== */
+
+  // 统一的列表项结构。
+  // url 与 file 二者必有其一：
+  //   file —— 拖入来源，播放时现场造 blob URL（有内存开销，切换时必须释放）
+  //   url  —— 启动器扫描来源，直接是 file:// 直链（不占额外内存）
+  function makeItem(name, size, ctime, mtime, url, file) {
+    var ext = extOf(name);
+    return {
+      name:     name,
+      size:     size || 0,
+      ctime:    ctime || 0,   // 创建时间（毫秒）；拖入来源拿不到，用修改时间顶替
+      mtime:    mtime || 0,   // 修改时间（毫秒）
+      ext:      ext,
+      url:      url || null,
+      file:     file || null,
+      playable: EXT_PLAYABLE.indexOf(ext) >= 0
+    };
+  }
+
+  // 比较两个列表项。正序 / 倒序由 plSortAsc 决定
+  function compareItems(a, b) {
+    var r = 0;
+
+    if (plSortField === 'name') {
+      // zh-CN + numeric：中文按拼音排，数字按数值排（第 2 集排在第 10 集前面）
+      r = a.name.localeCompare(b.name, 'zh-CN', { numeric: true });
+    } else if (plSortField === 'size') {
+      r = a.size - b.size;
+    } else if (plSortField === 'type') {
+      // 先按扩展名分组，同类型内再按文件名，让同类文件聚在一起
+      r = a.ext.localeCompare(b.ext, 'zh-CN');
+      if (r === 0) { r = a.name.localeCompare(b.name, 'zh-CN', { numeric: true }); }
+    } else {
+      // 时间：优先用创建时间，没有就退回修改时间
+      var ta = a.ctime || a.mtime;
+      var tb = b.ctime || b.mtime;
+      r = ta - tb;
+      if (r === 0) { r = a.name.localeCompare(b.name, 'zh-CN', { numeric: true }); }
+    }
+
+    return plSortAsc ? r : -r;
+  }
+
+  // 刷新计数：有搜索过滤时显示「可见 / 总数」
+  function updatePlCount() {
+    if (playlist.length === 0) {
+      plCountEl.textContent = '';
+    } else if (plVisible.length === playlist.length) {
+      plCountEl.textContent = playlist.length + ' 项';
+    } else {
+      plCountEl.textContent = plVisible.length + ' / ' + playlist.length;
+    }
+  }
+
+  // 重新排序 → 过滤 → 重绘列表。
+  // 所有会改变列表内容的操作（载入新列表、改排序、改搜索词）都走这里
+  function refreshPlaylist() {
+    // 排序会打乱下标，先记住当前播放项的「对象引用」，
+    // 排完再用 indexOf 找回它的新位置，否则高亮会跟丢
+    var curItem = plIndex >= 0 ? playlist[plIndex] : null;
+
+    playlist.sort(compareItems);
+
+    if (curItem) {
+      plIndex = playlist.indexOf(curItem);
+    }
+
+    // 按搜索词过滤出「可见项」的下标序列，连播也按这个顺序走
+    var keywords = splitKeywords(plQuery);
+    plVisible = [];
+    for (var i = 0; i < playlist.length; i++) {
+      if (matchKeywords(playlist[i].name, keywords)) { plVisible.push(i); }
+    }
+
+    // 拼字符串一次性写入，比逐条 createElement + appendChild 快得多
+    var html = '';
+    for (var k = 0; k < plVisible.length; k++) {
+      var idx = plVisible[k];
+      var it  = playlist[idx];
+
+      var cls = 'pl-item';
+      if (idx === plIndex) { cls += ' active'; }
+      if (!it.playable)    { cls += ' bad'; }
+
+      var badge = it.playable ? '' : '<span class="pl-badge">不支持</span>';
+      var meta  = fmtSize(it.size) + '  ·  ' + fmtDate(it.ctime || it.mtime);
+
+      html += '<div class="' + cls + '" data-i="' + idx + '" title="' + escHtml(it.name) + '">' +
+                '<span class="pl-idx">' + (k + 1) + '</span>' +
+                '<span class="pl-body">' +
+                  '<span class="pl-name">' + highlightName(it.name, keywords) + badge + '</span>' +
+                  '<span class="pl-meta">' + escHtml(meta) + '</span>' +
+                '</span>' +
+                拼动作条(it) +
+              '</div>';
+    }
+
+    if (plVisible.length === 0) {
+      html = '<div class="pl-empty">' + (playlist.length === 0
+        ? '列表为空<br>把<b>整个文件夹</b>拖进来即可自动扫描<br>或用启动器打开播放器自动载入'
+        : '没有匹配的文件<br>换个关键词试试') + '</div>';
+    }
+
+    plListEl.innerHTML = html;
+    plListEl.scrollTop = 0;
+    updatePlCount();
+  }
+
+  // 只改高亮，不重建列表（切集时比重绘整个列表快得多）
+  function refreshActiveItem() {
+    var items = plListEl.querySelectorAll('.pl-item');
+    for (var i = 0; i < items.length; i++) {
+      var el  = items[i];
+      var idx = parseInt(el.getAttribute('data-i'), 10);
+      if (idx === plIndex) {
+        el.classList.add('active');
+      } else {
+        el.classList.remove('active');
+      }
+    }
+  }
+
+  // 让当前播放项滚进可视区域。
+  //
+  // 【为什么不用 scrollIntoView】面板收起时整块列表被 translateX(100%) 挪到
+  // 视口右侧之外（x 从 1240 起）。此时调 scrollIntoView，浏览器为了让元素进视口，
+  // 会把「所有能滚的祖先」都滚一遍 —— 包括根本没打算滚的文档本身，
+  // 于是 body.scrollLeft 变成 320，整个 #app 被顶出去 320px。
+  // 后果是所有按视口居中的浮层（帮助 / 文件信息 / 删除确认）统统偏左，
+  // 左边还会被切掉一截。刷新页面才能复位，用户根本猜不到是为什么。
+  //
+  // 改成只动列表自己那一根竖向滚动条，横向一个像素都不碰。
+  function scrollToCurrent() {
+    if (plIndex < 0) { return; }
+    var cur = plListEl.querySelector('.pl-item.active');
+    if (!cur) { return; }
+
+    // 只用两框之差算，不碰 offsetTop —— offsetTop 依赖 offsetParent，
+    // 而且面板滑出到屏幕外时那些绝对坐标全是偏的
+    var 条框 = plListEl.getBoundingClientRect();
+    var 项框 = cur.getBoundingClientRect();
+
+    // block:'nearest' 的老脾气要保住：本来就在视野里就别动，
+    // 否则列表会自己跳一下，看着像故障
+    if (项框.top < 条框.top) {
+      plListEl.scrollTop -= (条框.top - 项框.top);
+    } else if (项框.bottom > 条框.bottom) {
+      plListEl.scrollTop += (项框.bottom - 条框.bottom);
+    }
+  }
+
+  // 面板滑入 / 滑出的这段时间里，每帧重算一次视频框尺寸，
+  // 让画面跟着舞台一起平滑变化，而不是等动画结束后突然跳一下
+  function animateLayout(duration) {
+    var endAt = Date.now() + duration;
+    function step() {
+      layoutFrame();
+      if (Date.now() < endAt) { requestAnimationFrame(step); }
+    }
+    requestAnimationFrame(step);
+  }
+
+  // 展开 / 收起播放列表面板
+  function setPlaylistOpen(open) {
+    if (open === plOpen) { return; }
+    plOpen = open;
+
+    if (open) {
+      app.classList.add('pl-open');
+      btnPlList.classList.add('active');
+    } else {
+      app.classList.remove('pl-open');
+      btnPlList.classList.remove('active');
+    }
+
+    // 【不留痕】这里原先会把展开状态写进 localStorage，下次打开自动沿用。
+    // 现在去掉：每次打开都回到默认（收起），关掉再开不留任何痕迹。
+
+    animateLayout(260);
+    if (open) { scrollToCurrent(); }
+    console.log('[冰冰播放器] 播放列表：' + (open ? '展开' : '收起'));
+  }
+
+  function togglePlaylist() {
+    setPlaylistOpen(!plOpen);
+  }
+
+  // 音频占位层的开关。
+  // 音频没有视频轨，<video> 播出来就是一整块黑 —— 盖一张卡片说明「在放歌」。
+  // 换片、清空列表都要走这里复位，别把上一个文件的名字留在屏幕上。
+  function setAudioMode(on, 名字) {
+    if (on) {
+      afName.textContent = 名字 || '';
+      app.classList.add('audio-mode');
+    } else {
+      afName.textContent = '';
+      app.classList.remove('audio-mode');
+      app.classList.remove('playing');   // 顺手把唱片旋转状态清掉
+    }
+  }
+
+  // 播放列表中的第 index 项。
+  // autoplay 为 false 时只载入、不出声播放 —— 用于启动器扫到列表后被动载入第一项：
+  // 那时候没有任何用户手势，直接 play() 必被浏览器策略拦下，
+  // 不如把画面停在第一帧，让用户自己按空格开始
+  function playItem(index, autoplay) {
+    if (index < 0 || index >= playlist.length) { return; }
+    var it = playlist[index];
+
+    // 内核不支持其容器：给明确提示，但不打断当前正在播的内容
+    if (!it.playable) {
+      showError('<b>无法播放 .' + escHtml(it.ext) + ' 文件</b><br>' +
+                '浏览器内核不支持 ' + escHtml(it.ext.toUpperCase()) + ' 容器。<br>' +
+                '请先用转码工具（如 ffmpeg）转成 mp4（视频）或 mp3（音频）后再播放。');
+      return;
+    }
+
+    clearError();
+
+    // 关键：切换前先暂停并释放上一个 blob。
+    // 连续载入多个文件时若不释放，blob 会一直累积，内存直接顶上去。
+    // 磁盘直链（file://）不是 blob，本身不存在释放问题。
+    video.pause();
+    if (currentUrl) {
+      URL.revokeObjectURL(currentUrl);
+      console.log('[冰冰播放器] 已释放上一个 blob URL');
+      currentUrl = null;
+    }
+
+    if (it.file) {
+      // 拖入来源：用 File 现场造 blob URL
+      currentUrl = URL.createObjectURL(it.file);
+      video.src = currentUrl;
+    } else {
+      // 启动器扫描来源：直接走 file:// 直链，不占额外内存
+      video.src = it.url;
+    }
+
+    plIndex = index;
+
+    // 重要：换源会把 playbackRate 重置回 1.0，
+    // 这里重新套用当前速度档位，保证换片后调速设置不丢失
+    video.playbackRate = SPEED_STEPS[speedIndex];
+
+    // 换片后画面回到原始状态：上一部片的缩放和锚点平移不该带到下一部去
+    resetZoom();
+    // 帧长也要重新测：不同片子不一定是同一个帧率
+    startFrameGapProbe();
+
+    // 顶部信息：文件名 + 体积 + 在可见列表中的位置
+    var pos = plVisible.indexOf(index);
+    fnameEl.textContent = it.name;
+    fmetaEl.textContent = fmtSize(it.size) +
+      (plVisible.length > 1 && pos >= 0 ? '  ·  ' + (pos + 1) + ' / ' + plVisible.length : '');
+
+    emptyBox.classList.add('hide');
+    app.classList.remove('no-file');
+
+    // 音频切「占位」形态，视频自动切回。判定只看扩展名，不看元数据 ——
+    // 元数据要等 loadedmetadata，那时屏幕上已经先黑一下了
+    setAudioMode(EXT_AUDIO.indexOf(it.ext) >= 0, it.name);
+
+    refreshActiveItem();
+    scrollToCurrent();
+
+    console.log('[冰冰播放器] 播放第 ' + (index + 1) + ' 项：' + it.name +
+                ' | 来源：' + (it.file ? '拖入' : '磁盘'));
+
+    // 被动载入（启动器扫描来的第一项）：不出声播放，等用户按空格
+    if (autoplay === false) {
+      console.log('[冰冰播放器] 已载入待播，等待用户开始');
+      return;
+    }
+
+    // 拖放 / 选文件都算用户手势，通常允许带声音自动播放；
+    // 万一被策略拦下，用回调提示用户手动开始
+    video.play().then(function () {
+      console.log('[冰冰播放器] 开始播放');
+    }).catch(function (err) {
+      console.log('[冰冰播放器] 自动播放未成功：' + err);
+      // AbortError 表示 play() 被紧随其后的 pause() 打断了，
+      // 典型场景是拖入文件后立刻按空格暂停 —— 此时视频其实已经就绪，
+      // 再提示「按空格键开始播放」会误导用户，直接忽略即可。
+      // 只有真被自动播放策略拦下（NotAllowedError）才需要提示。
+      if (err && err.name === 'AbortError') { return; }
+      showToast('按空格键开始播放');
+    });
+  }
+
+  // 按「可见顺序」切到上一项 / 下一项。
+  // 之所以按可见顺序而不是全量顺序：用户搜索后点开某一条，
+  // 自然是希望连播搜索结果里的下一条
+  function stepPlaylist(delta) {
+    if (plVisible.length === 0) {
+      showToast(playlist.length === 0 ? '播放列表是空的' : '当前筛选没有匹配项');
+      return;
+    }
+
+    var pos = plVisible.indexOf(plIndex);
+    if (pos < 0) {
+      // 还没选中任何项时，按「下一个」从头开始、按「上一个」从尾开始
+      pos = delta > 0 ? -1 : plVisible.length;
+    }
+
+    var next = pos + delta;
+    if (next < 0) {
+      showToast('已经是第一个');
+      return;
+    }
+    if (next >= plVisible.length) {
+      showToast('已经是最后一个');
+      return;
+    }
+
+    playItem(plVisible[next]);
+    showToast(delta > 0 ? '下一个' : '上一个');
+  }
+
+  // 跳到可见列表的头部 / 尾部（Home / End）。
+  // 与 stepPlaylist 一样按「可见顺序」走：搜索之后按 Home，
+  // 跳的是搜索结果里的第一条，而不是全量清单的第一条。
+  function jumpPlaylist(goLast) {
+    if (plVisible.length === 0) {
+      showToast(playlist.length === 0 ? '播放列表是空的' : '当前筛选没有匹配项');
+      return;
+    }
+
+    var target = goLast ? plVisible[plVisible.length - 1] : plVisible[0];
+    if (target === plIndex) {
+      showToast(goLast ? '已经是最后一个' : '已经是第一个');
+      return;
+    }
+
+    playItem(target);
+    showToast(goLast ? '已跳到最后一个' : '已跳到第一个');
+  }
+
+  // 用一批列表项替换当前播放列表。
+  // autoPlay 为真时自动播放第一条（拖入文件 / 文件夹场景，有用户手势，能自动播起来）
+  function setPlaylist(items, autoPlay) {
+    playlist = items;
+    plIndex  = -1;
+    plQuery  = '';
+    plSearch.value = '';
+    plClear.classList.remove('show');
+
+    refreshPlaylist();
+    console.log('[冰冰播放器] 播放列表已更新：共 ' + items.length + ' 项');
+
+    if (plVisible.length === 0) { return; }
+
+    // 从排序后的第一条开始，而不是拖入顺序的第一条
+    if (autoPlay) {
+      playItem(plVisible[0]);
+      return;
+    }
+
+    // 没自动播的场景（启动器扫描来的列表）：
+    // 仍然要载入第一项 —— 否则 app 会停在「无文件」状态、控制条被隐藏，
+    // 用户连打开列表的按钮都找不到。只是不出声，等他自己按空格
+    playItem(plVisible[0], false);
+
+    // 【不留痕】这里原先会读取 localStorage 里上次的面板展开状态并自动展开。
+    // 现在不读了 —— 列表载入后保持默认的收起状态，用户需要时自己点开
+  }
+
+  /* ---------- 5.7.1 拖入内容处理 ---------- */
+
+  // 反复调用 readEntries 直到拿空数组。
+  // 必须这样循环：readEntries 每次最多只返回 100 项，
+  // 只调一次的话大文件夹会静默漏文件
+  function readEntriesAll(reader, out, done) {
+    reader.readEntries(function (batch) {
+      if (!batch || batch.length === 0) { done(); return; }
+      for (var i = 0; i < batch.length; i++) { out.push(batch[i]); }
+      readEntriesAll(reader, out, done);
+    }, function () { done(); });
+  }
+
+  // 递归枚举一个拖入项（文件或文件夹），把文件收集进 out。
+  // 传入的是「包」对象：{ entry, item } —— item 用于 entry 读取失败时兜底。
+  // 全部读完后回调 done —— 用计数器而非 Promise，避免层层嵌套
+  function walkEntry(pack, out, done) {
+    var entry = pack && pack.entry;
+    if (!entry) { done(); return; }
+
+    if (entry.isFile) {
+      entry.file(function (f) {
+        out.push(f);
+        done();
+      }, function (err) {
+        // file:// 页面下 entry.file() 有可能直接失败（实测报 EncodingError），
+        // 这时退回同一个拖入项的 getAsFile() —— 那条通路不依赖 entry
+        var name = err && err.name ? err.name : err;
+        console.log('[冰冰播放器] entry.file 读取失败（' + name + '），改用 getAsFile 兜底');
+        var fb = (pack.item && typeof pack.item.getAsFile === 'function')
+          ? pack.item.getAsFile()
+          : null;
+        if (fb) {
+          console.log('[冰冰播放器] getAsFile 兜底成功：' + fb.name);
+          out.push(fb);
+        }
+        done();
+      });
+      return;
+    }
+
+    if (entry.isDirectory) {
+      var reader  = entry.createReader();
+      var entries = [];
+      readEntriesAll(reader, entries, function () {
+        if (entries.length === 0) { done(); return; }
+        var pending = entries.length;
+        var oneDone = function () {
+          pending--;
+          if (pending === 0) { done(); }
+        };
+        for (var i = 0; i < entries.length; i++) {
+          // 递归读出来的子项没有对应的 DataTransferItem，item 传 null
+          walkEntry({ entry: entries[i], item: null }, out, oneDone);
+        }
+      });
+      return;
+    }
+
+    done();
+  }
+
+  // 拖入的内容若只有一个文件、且它已经在当前列表里（按文件名匹配），
+  // 就直接切到那一项、不重建列表 ——
+  // 免得从片库里单独拖一个文件进来，反而把整份扫描好的列表冲掉
+  function tryLocateInPlaylist(files) {
+    if (!files || files.length !== 1 || playlist.length === 0) { return false; }
+
+    var name = files[0].name;
+    for (var i = 0; i < playlist.length; i++) {
+      // 只匹配「来自磁盘扫描」的项，它们才带 url
+      if (playlist[i].name === name && playlist[i].url) {
+        console.log('[冰冰播放器] 拖入的文件已在列表中，直接切到该项：' + name);
+        setPlaylistOpen(true);
+        playItem(i);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // 把一批 File 对象转成列表项并载入
+  function loadFilesToList(files) {
+    if (!files || files.length === 0) { return; }
+    if (tryLocateInPlaylist(files)) { return; }
+
+    var items = [];
+    for (var i = 0; i < files.length; i++) {
+      var f   = files[i];
+      var ext = extOf(f.name);
+      // 只收媒体文件；字幕、封面图、说明文本之类一律忽略
+      if (EXT_MEDIA.indexOf(ext) < 0) { continue; }
+      // 浏览器只暴露修改时间，拿不到真正的「创建时间」，只能用它近似
+      items.push(makeItem(f.name, f.size, f.lastModified, f.lastModified, null, f));
+    }
+
+    if (items.length === 0) {
+      showError('<b>没有找到可播放的视频</b><br>拖入的内容里没有 mp4 / webm / mov 等视频文件。');
+      return;
+    }
+
+    setPlaylist(items, true);
+  }
+
+  // 处理拖放内容：可能是文件，也可能是文件夹
+  //
+  // 这里有一条踩过坑的实测结论（2026-09-17）：
+  //   file:// 页面在**没有** --allow-file-access-from-files 启动参数时，
+  //   FileSystemFileEntry.file() 会直接失败（报 EncodingError），
+  //   于是「靠 entry 收集文件」这条路一个文件都拿不到 —— 拖入 mp4 会提示
+  //   「这个文件夹里没有视频文件」。
+  //   加了该参数就成功，与文件放在哪个盘（本机 / 移动硬盘）无关。
+  //
+  // 所以策略改成：
+  //   纯文件   → 直接用浏览器给的 dt.files（file:// 下最稳，而且是同步的，最快）
+  //   含文件夹 → 才走 entry 递归（文件夹只能靠 entry 读）
+  //   万一 entry 还是没读到东西 → 再退回 dt.files 快照兜底
+  function handleDrop(dt) {
+    // dt.files / dt.items 只在 drop 事件处理期间有效，
+    // 所以先把文件同步快照出来，后面异步流程里还能用
+    var snapshot = [];
+    if (dt.files) {
+      for (var k = 0; k < dt.files.length; k++) { snapshot.push(dt.files[k]); }
+    }
+
+    // webkitGetAsEntry 同样必须在事件处理中同步调用，事件结束后 items 就失效了
+    var entries = [];
+    var items   = dt.items;
+    var hasDir  = false;
+    if (items && items.length > 0 && typeof items[0].webkitGetAsEntry === 'function') {
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].kind !== 'file') { continue; }
+        var en = items[i].webkitGetAsEntry();
+        if (!en) { continue; }
+        if (en.isDirectory) { hasDir = true; }
+        entries.push({ entry: en, item: items[i] });
+      }
+    }
+
+    console.log('[冰冰播放器] 拖入内容：文件 ' + snapshot.length +
+                ' 个 | entry ' + entries.length + ' 个 | 含文件夹 ' + hasDir);
+
+    // 情况一：纯文件（最常见）—— 直接用浏览器给的文件对象，完全不碰 entry
+    if (!hasDir && snapshot.length > 0) {
+      loadFilesToList(snapshot);
+      return;
+    }
+
+    // 情况二：拖了文件夹，或没拿到文件列表 —— 靠 entry 递归展开
+    var collected = [];
+    var pending   = entries.length;
+    var oneDone   = function () {
+      pending--;
+      if (pending !== 0) { return; }
+
+      console.log('[冰冰播放器] 拖入扫描完成，共发现 ' + collected.length + ' 个文件');
+
+      if (collected.length === 0) {
+        // entry 通路仍拿不到东西时，退回文件快照兜底
+        if (snapshot.length > 0) {
+          console.log('[冰冰播放器] entry 通路未取到文件，回退到浏览器文件列表兜底');
+          loadFilesToList(snapshot);
+          return;
+        }
+        if (hasDir) {
+          showError('<b>没能读到拖入的文件夹</b><br>浏览器内核拒绝了读取本地文件夹。<br>可把文件夹拖到「冰冰播放器.bat」图标上打开，<br>或先把浏览器完全关掉，再启动本播放器后重试。');
+        } else {
+          showError('<b>没能读到拖入的文件</b><br>可以改用「打开文件」按钮选择，<br>或把文件放到播放器同目录后用启动器打开。');
+        }
+        return;
+      }
+      loadFilesToList(collected);
+    };
+
+    if (entries.length === 0) {
+      // 连 entry 都没有（老内核）—— 只剩文件快照这条路
+      oneDone();
+      return;
+    }
+
+    for (var j = 0; j < entries.length; j++) {
+      walkEntry(entries[j], collected, oneDone);
+    }
+  }
+
+  /* ---------- 5.7.2 启动器生成的本地清单 ---------- */
+
+  // 读取启动器扫描生成的 _播放列表.js。
+  //
+  // 为什么用 <script src> 而不是 fetch / XHR：
+  //   file:// 协议下浏览器会拦截 fetch / XHR 读本地文件（CORS 限制），
+  //   但普通脚本属于「子资源」，不受这条限制 —— 这是最省事的读取通路。
+  //
+  // 清单不存在时（例如直接双击 html 打开）会触发 onerror，静默跳过即可。
+  function loadDiskPlaylist() {
+    var s = document.createElement('script');
+    // 带时间戳，避免浏览器拿到上一次的旧清单
+    s.src = './_播放列表.js?t=' + Date.now();
+
+    s.onload = function () {
+      if (s.parentNode) { s.parentNode.removeChild(s); }
+
+      var data = window.BB_PLAYLIST;
+      if (!data || !data.files) {
+        console.log('[冰冰播放器] 本地清单内容为空，跳过');
+        return;
+      }
+
+      // 【不留痕 · 关键闸门】只认「本次刚扫描出来的」清单。
+      //
+      // 为什么非要这道闸：清单文件是落在磁盘上的。直接双击 html 打开时，
+      // 读到的是上一次（可能是几小时前）留下的旧清单，
+      // 表现就是「一打开播放器就冒出上次那个目录的视频列表」——
+      // 这正是要消掉的「历史记录」。
+      //
+      // 外壳每次启动都会重写清单，所以本次扫描的清单一定带着刚打上的 stamp。
+      // 没有 stamp（老格式）或已过期的，一律当陈旧数据丢掉。
+      var freshMs = 90 * 1000;   // 90 秒内算新鲜（扫描本身最多几秒，留足余量）
+
+      // 本窗口「已经认过」的清单戳（sessionStorage）。
+      //
+      // 只为一件事：按 F5 / Ctrl+R 刷新时，别把正在播的视频连列表一起弄丢。
+      // 清单是启动那一刻写的，页面开着看几分钟之后就超过 90 秒了，
+      // 光看新鲜度会把它当陈旧数据丢掉 —— 刷新一次就空了。
+      //
+      // 为什么不违背「不留痕」：sessionStorage 只活在当前这个窗口里，
+      // 窗口一关就没了，下一次启动的新窗口看不到它（--incognito 下更是各窗口独立）。
+      // 它记住的仅仅是「本窗口当前正在用的那份清单」，不是「上次播过什么」。
+      // （原先用 localStorage 存面板展开态/音量才叫留痕，那个已经拆掉了。）
+      var seenStamp = sessionStorage.getItem('bbplayer.listStamp') || '';
+
+      var staleReason = '';
+      if (!data.stamp) {
+        staleReason = '老格式清单，没有时间戳';
+      } else if ((Date.now() - data.stamp) > freshMs && String(data.stamp) !== seenStamp) {
+        staleReason = Math.round((Date.now() - data.stamp) / 1000) + ' 秒前生成的，已过期';
+      }
+      if (staleReason) {
+        console.log('[冰冰播放器] 忽略过期清单（' + staleReason + '）');
+        return;
+      }
+
+      // 认下这份清单，把戳记在本窗口里，刷新时凭它复用
+      sessionStorage.setItem('bbplayer.listStamp', String(data.stamp));
+
+      // PowerShell 的 ConvertTo-Json 在数组只有一个元素时会把数组退化成单个对象，
+      // 这里兜住它 —— 否则 data.files.length 是 undefined，一项都读不进来
+      var files = data.files;
+      if (typeof files.length !== 'number') { files = [files]; }
+      if (files.length === 0) {
+        console.log('[冰冰播放器] 本地清单里没有视频文件');
+        return;
+      }
+
+      // 已经有内容了（用户抢先拖入了东西）就不再覆盖，以用户操作为准
+      if (playlist.length > 0) {
+        console.log('[冰冰播放器] 已有列表内容，忽略本地清单');
+        return;
+      }
+
+      var items = [];
+      for (var i = 0; i < files.length; i++) {
+        var f = files[i];
+        // 清单里给的是绝对 file:// 直链，跨目录、中文路径都能直接播
+        items.push(makeItem(f.n, f.s, f.c, f.m, f.u, null));
+      }
+
+      console.log('[冰冰播放器] 读取到本地清单：' + items.length + ' 个文件' +
+                  (data.dir ? ' | 目录 ' + data.dir : ''));
+
+      setPlaylist(items, false);
+
+      // 启动器指定了「开机就播这个文件」时（把文件拖到 bat 图标上启动的场景），
+      // 找到对应项直接播它
+      if (data.play) {
+        for (var k = 0; k < playlist.length; k++) {
+          if (playlist[k].name === data.play) {
+            setPlaylistOpen(true);
+            playItem(k);
+            break;
+          }
+        }
+      }
+    };
+
+    s.onerror = function () {
+      if (s.parentNode) { s.parentNode.removeChild(s); }
+      console.log('[冰冰播放器] 未发现本地清单（直接双击 html 打开时属正常）');
+    };
+
+    document.head.appendChild(s);
+  }
+
+  /* ==================================================================
+     五点八、本地小桥（只有从 EXE 启动时才有）
+     ================================================================== */
+
+  // 播放页面是 file:// 打开的普通网页，浏览器不允许网页删磁盘文件、
+  // 也不允许调起资源管理器 —— 这是硬限制，绕不过去。
+  // 这两件事只能交给外壳：外壳在播放期间开了个只监听 127.0.0.1 的小服务
+  // （见 _devtools\_壳源码\小桥.py），端口与口令通过启动地址的
+  // #bbp=端口-口令 片段带给页面。
+  //
+  // 直接双击 html 打开时没有这段碎片 → 小桥为空 →
+  // 「打开文件夹 / 删除」会明确提示要先从 EXE 启动，而不是默默失败。
+  var bridge = { port: 0, token: '' };
+
+  function readBridge() {
+    var 碎片 = (location.hash || '').replace(/^#/, '');
+    var m = 碎片.match(/bbp=(\d+)-([0-9a-f]+)/);
+    if (!m) {
+      console.log('[冰冰播放器] 没有小桥信息（不是从 EXE 启动的，属正常）');
+      return false;
+    }
+    bridge.port  = parseInt(m[1], 10);
+    bridge.token = m[2];
+    console.log('[冰冰播放器] 小桥已就绪 | 端口 ' + bridge.port);
+    return true;
+  }
+
+  // 整个函数只用回调，不写 try/catch：
+  // 连不上、口令不对、被拒绝，三种情况都从 done(错误, 数据) 这一个出口出来
+  function bridgeCall(op, path, done) {
+    if (!bridge.port) {
+      done('这个操作要外壳帮忙才行，请从桌面图标或双击视频打开播放器', null);
+      return;
+    }
+    var url = 'http://127.0.0.1:' + bridge.port + '/' + op + '?t=' + bridge.token;
+    if (path) { url += '&p=' + encodeURIComponent(path); }
+
+    fetch(url).then(function (r) {
+      return r.json();
+    }).then(function (data) {
+      if (data && data.ok) { done(null, data); }
+      else { done((data && data.reason) || '小桥没能完成这个操作', data); }
+    }).catch(function (err) {
+      done('连不上小桥（外壳可能已经退出了）：' + err, null);
+    });
+  }
+
+  // 心跳：每 15 秒 ping 一次。
+  // 外壳靠它判断窗口还在不在 —— 窗口一关心跳就停，外壳 45 秒后自动收摊，
+  // 不会留一个后台进程（和「关掉重开不留痕迹」的口径一致）。
+  function startBridgeHeartbeat() {
+    if (!bridge.port) { return; }
+    setInterval(function () {
+      bridgeCall('ping', '', function () {});
+    }, 15000);
+  }
+
+  // 从清单项里取出磁盘上的真实路径。
+  //   启动器扫描来源：url 是 file:// 直链，能还原成 Windows 路径
+  //   拖入来源：浏览器不给真实路径，只能返回空串
+  //     （这类文件删不了、也没法定位，列表里干脆不显示那三个图标）
+  function itemDiskPath(it) {
+    if (!it || !it.url || it.url.indexOf('file://') !== 0) { return ''; }
+    var 余下 = it.url.slice(7);
+    var 路径;
+    if (余下.charAt(0) === '/') {
+      路径 = 余下.slice(1);        // file:///D:/a/b.mp4 → D:/a/b.mp4
+    } else {
+      路径 = '//' + 余下;          // file://服务器/共享/… → UNC 路径
+    }
+    return decodeURIComponent(路径).replace(/\//g, '\\');
+  }
+
+  /* ---------- 列表行动的三个图标 ---------- */
+
+  // 内联 SVG，省得依赖外部文件
+  var 图标文件夹 = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" ' +
+    'stroke-linejoin="round"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h7A1.5 1.5 0 0 1 19 10v6.5' +
+    'A1.5 1.5 0 0 1 17.5 18h-13A1.5 1.5 0 0 1 3 16.5z"/></svg>';
+  var 图标信息 = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" ' +
+    'stroke-linecap="round"><circle cx="12" cy="12" r="8.2"/><path d="M12 11v5.4"/><path d="M12 7.9h.01"/></svg>';
+  var 图标删除 = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" ' +
+    'stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 7h15"/>' +
+    '<path d="M9.5 7V5.4A1.4 1.4 0 0 1 10.9 4h2.2a1.4 1.4 0 0 1 1.4 1.4V7"/>' +
+    '<path d="M6.6 7l.9 11.2A1.5 1.5 0 0 0 9 19.6h6a1.5 1.5 0 0 0 1.5-1.4L17.4 7"/>' +
+    '<path d="M10.4 10.6v5.6M13.6 10.6v5.6"/></svg>';
+
+  // 拼出列表行尾的动作条。没有磁盘路径的行不拼（返回空串）
+  function 拼动作条(it) {
+    if (!itemDiskPath(it)) { return ''; }
+    return '<span class="pl-act">' +
+             '<button class="pl-icon folder" data-act="reveal" title="打开所在文件夹">' + 图标文件夹 + '</button>' +
+             '<button class="pl-icon"        data-act="info"   title="文件信息">' + 图标信息 + '</button>' +
+             '<button class="pl-icon danger" data-act="delete" title="删除文件（DEL，进回收站）">' + 图标删除 + '</button>' +
+           '</span>';
+  }
+
+  function runRowAction(act, index) {
+    if (act === 'reveal') { revealItem(index); return; }
+    if (act === 'info')   { showFileInfo(index); return; }
+    if (act === 'delete') { askDelete(index);   return; }
+  }
+
+  // 在资源管理器中定位这个文件
+  function revealItem(index) {
+    var it = playlist[index];
+    if (!it) { return; }
+    var 路径 = itemDiskPath(it);
+    if (!路径) { showToast('拖入的文件拿不到磁盘路径'); return; }
+    console.log('[冰冰播放器] 请求定位：' + 路径);
+    bridgeCall('reveal', 路径, function (错) {
+      if (错) { showToast('打开文件夹失败：' + 错); return; }
+      showToast('已在资源管理器中定位');
+    });
+  }
+
+  /* ==================================================================
+     五点九、弹窗（快捷键表 / 文件信息 / 删除确认）
+     ================================================================== */
+
+  var modalEl   = document.getElementById('modal');
+  var maskEl    = document.getElementById('mask');
+  var modalOpen = false;
+  var modalEnter = null;    // 回车键要触发的那个按钮（确认类弹窗用）
+
+  // 打开弹窗。选项：title / tag / body(HTML) / buttons[{text, kind, onClick}]
+  function openModal(选项) {
+    var 按钮们 = 选项.buttons || [];
+    var html = '';
+
+    html += '<div class="md-head">' +
+              '<span class="md-title">' + 选项.title + '</span>' +
+              (选项.tag ? '<span class="md-tag">' + 选项.tag + '</span>' : '') +
+              '<span class="md-spacer"></span>' +
+              '<button class="md-x" data-md="close" title="关闭（Esc）">✕</button>' +
+            '</div>';
+    html += '<div class="md-body">' + 选项.body + '</div>';
+
+    if (按钮们.length) {
+      html += '<div class="md-foot">';
+      for (var i = 0; i < 按钮们.length; i++) {
+        html += '<button class="md-btn ' + (按钮们[i].kind || '') + '" data-md="btn' + i + '">' +
+                  按钮们[i].text + '</button>';
+      }
+      html += '</div>';
+    }
+
+    modalEl.innerHTML = html;
+
+    // 把回调直接挂到按钮上（弹窗内容是每次都重建的，逐次绑定最省心）
+    var 节点们 = modalEl.querySelectorAll('[data-md]');
+    for (var k = 0; k < 节点们.length; k++) {
+      var 名 = 节点们[k].getAttribute('data-md');
+      if (名 === 'close') {
+        节点们[k].onclick = closeModal;
+      } else {
+        var 序号 = parseInt(名.slice(3), 10);
+        节点们[k].onclick = 按钮们[序号].onClick;
+      }
+    }
+
+    // 回车默认触发最后一个按钮 —— 确认框里「确定 / 删除」都排在最后
+    modalEnter = 按钮们.length ? 按钮们[按钮们.length - 1].onClick : null;
+
+    maskEl.classList.add('show');
+    app.classList.add('modal-open');
+    modalOpen = true;
+    wakeControls();
+    console.log('[冰冰播放器] 弹窗打开：' + 选项.title);
+  }
+
+  function closeModal() {
+    if (!modalOpen) { return; }
+    maskEl.classList.remove('show');
+    modalEl.innerHTML = '';
+    app.classList.remove('modal-open');
+    modalOpen = false;
+    modalEnter = null;
+  }
+
+  // 点遮罩空白处关闭（点弹窗里面不关）
+  maskEl.addEventListener('click', function (e) {
+    if (e.target === maskEl) { closeModal(); }
+  });
+
+  /* ---------- 快捷键表 ---------- */
+
+  // 键写法约定：
+  //   数组   → 每个元素做成一个键帽（'+' 渲染成加号）
+  //   字符串 → 原样当说明文字用（那种不是按键的东西，比如「行上悬停」）
+  var 快捷键表 = [
+    { 组: '播放', 项: [
+      [['空格'], '播放 / 暂停'],
+      [['←', '→'], '后退 / 前进 5 秒'],
+      [['Ctrl', '+', '←', '→'], '后退 / 前进 60 秒'],
+      [['↑', '↓'], '音量加 / 减'],
+      [['M'], '静音开关'],
+      [['回车'], '窗口 / 全屏']
+    ]},
+    { 组: '调速', 项: [
+      [['+', '='], '加速一档'],
+      [['-'], '减速一档'],
+      [['0'], '回到 1.0 倍速'],
+      ['点控制条上 1.0x', '也能恢复原速']
+    ]},
+    { 组: '画面', 项: [
+      [['[', ']'], '画面左转 / 右转 90°'],
+      [['R'], '画面复位（旋转 + 缩放一起）'],
+      [['滚轮'], '按鼠标位置放大缩小（1～8 倍）'],
+      [['F', 'D'], '逐帧 前进 / 后退（会先自动暂停）'],
+      [['比例', '填充'], '控制条上那两个下拉框']
+    ]},
+    { 组: '播放列表', 项: [
+      [['L'], '展开 / 收起列表'],
+      [['N', 'P'], '下一个 / 上一个'],
+      [['PgDn', 'PgUp'], '同上（与 N / P 同义）'],
+      [['Home', 'End'], '跳到首 / 尾（按当前筛选结果）'],
+      [['DEL'], '删除当前文件（进回收站）'],
+      ['把鼠标移到列表行上', '浮出：打开文件夹 / 文件信息 / 删除']
+    ]},
+    { 组: '搜索与窗口', 项: [
+      [['?', 'F1'], '打开这张快捷键表'],
+      [['Esc'], '关闭弹窗 / 清空搜索框'],
+      ['右上角 ×', '关闭窗口'],
+      ['搜索框', '空格分词，多个关键词一起筛']
+    ]},
+    { 组: '拖入', 项: [
+      ['拖入视频 / 音频', '直接播放'],
+      ['拖入文件夹', '扫出里面的视频和音频，建播放列表']
+    ]}
+  ];
+
+  // 把一组键渲染成键帽。字符串原样输出（不包 kbd）
+  function 键格(键) {
+    if (typeof 键 === 'string') { return '<span class="hp-plain">' + escHtml(键) + '</span>'; }
+    var html = '';
+    for (var i = 0; i < 键.length; i++) {
+      if (键[i] === '+') { html += '<span class="hp-plus">+</span>'; }
+      else { html += '<kbd>' + escHtml(键[i]) + '</kbd>'; }
+    }
+    return html;
+  }
+
+  function 快捷键表HTML() {
+    var html = '<div class="hp-grid">';
+    for (var i = 0; i < 快捷键表.length; i++) {
+      html += '<div class="hp-group"><h4>' + escHtml(快捷键表[i].组) + '</h4>';
+      for (var k = 0; k < 快捷键表[i].项.length; k++) {
+        html += '<div class="hp-row">' +
+                  '<span class="hp-k">' + 键格(快捷键表[i].项[k][0]) + '</span>' +
+                  '<span class="hp-t">' + escHtml(快捷键表[i].项[k][1]) + '</span>' +
+                '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    html += '<div class="hp-note">' +
+              '<b>删除不是彻底删</b>：文件进的是回收站，随时能还原。<br>' +
+              '<b>打开文件夹 / 删除 / 文件信息</b>这三项要外壳配合，' +
+              '所以只有从桌面图标、或双击视频打开播放器时才能用；' +
+              '直接把 html 拖进浏览器打开时没有这三项。' +
+            '</div>';
+    return html;
+  }
+
+  function showHelp() {
+    openModal({ title: '快捷键一览', tag: '冰冰播放器', body: 快捷键表HTML() });
+  }
+
+  /* ---------- 文件信息 ---------- */
+
+  function showFileInfo(index) {
+    var it = playlist[index];
+    if (!it) { return; }
+    var 路径 = itemDiskPath(it);
+
+    var html = '';
+    html += '<div class="if-row"><span class="if-k">文件名</span><span class="if-v">' +
+            escHtml(it.name) + '</span></div>';
+    html += '<div class="if-row"><span class="if-k">格式</span><span class="if-v">' +
+            (it.ext ? escHtml(it.ext.toUpperCase()) : '未知') +
+            (it.playable ? '' : '（内核不支持这种容器，只能看到、播不了）') + '</span></div>';
+    html += '<div class="if-row"><span class="if-k">体积</span><span class="if-v">' +
+            fmtSize(it.size) + '（' + String(it.size || 0) + ' 字节）</span></div>';
+    html += '<div class="if-row"><span class="if-k">创建时间</span><span class="if-v">' +
+            (it.ctime ? escHtml(fmtDate(it.ctime)) : '—') + '</span></div>';
+    html += '<div class="if-row"><span class="if-k">修改时间</span><span class="if-v">' +
+            (it.mtime ? escHtml(fmtDate(it.mtime)) : '—') + '</span></div>';
+
+    // 正在播的这一项，时长和分辨率从 video 元素里现取
+    if (index === plIndex && video.videoWidth) {
+      html += '<div class="if-row"><span class="if-k">画面</span><span class="if-v">' +
+              video.videoWidth + ' × ' + video.videoHeight + '</span></div>';
+    }
+    if (index === plIndex && isFinite(video.duration) && video.duration > 0) {
+      html += '<div class="if-row"><span class="if-k">时长</span><span class="if-v">' +
+              escHtml(fmtTime(video.duration)) + '</span></div>';
+    }
+
+    html += '<div class="if-row"><span class="if-k">路径</span><span class="if-v mono">' +
+            (路径 ? escHtml(路径) : '（拖入的文件，浏览器不提供磁盘路径）') + '</span></div>';
+
+    // 能连上小桥时再补一段「此刻磁盘上的真实数据」——
+    // 清单是扫描那一刻的快照，文件后来被改过的话，只有这段是准的
+    if (路径) { html += '<div id="ifLive"></div>'; }
+
+    openModal({ title: '文件信息', tag: it.playable ? '' : '内核不支持', body: html });
+
+    if (!路径) { return; }
+    bridgeCall('info', 路径, function (错, 数据) {
+      var 盒 = document.getElementById('ifLive');
+      if (!盒) { return; }        // 弹窗已经被关掉了，没什么可填的
+      if (错) {
+        盒.innerHTML = '<div class="if-note">读不到磁盘上的实时数据：' + escHtml(错) + '</div>';
+        return;
+      }
+      var 信 = 数据.info;
+      盒.innerHTML =
+        '<div class="if-note">以下是此刻磁盘上的真实数据</div>' +
+        '<div class="if-row"><span class="if-k">实测体积</span><span class="if-v">' +
+          escHtml(fmtSize(信.size)) + '</span></div>' +
+        '<div class="if-row"><span class="if-k">磁盘创建</span><span class="if-v">' +
+          escHtml(fmtDate(信.ctime)) + '</span></div>' +
+        '<div class="if-row"><span class="if-k">磁盘修改</span><span class="if-v">' +
+          escHtml(fmtDate(信.mtime)) + '</span></div>' +
+        '<div class="if-row"><span class="if-k">文件属性</span><span class="if-v">' +
+          escHtml(信.attrs) + '</span></div>';
+    });
+  }
+
+  /* ---------- 删除（先进回收站） ---------- */
+
+  // 两段式：先弹确认，点了「删除」才真删。
+  // 删文件这种事不该一键完成 —— 手滑的代价太大
+  function askDelete(index) {
+    var it = playlist[index];
+    if (!it) { return; }
+
+    var 路径 = itemDiskPath(it);
+    if (!路径) {
+      showToast('拖入的文件拿不到磁盘路径\n没法删除');
+      return;
+    }
+    if (!bridge.port) {
+      showToast('删除需要外壳配合\n请从桌面图标或双击视频打开播放器');
+      return;
+    }
+
+    openModal({
+      title: '删除文件',
+      tag: '进回收站',
+      body: '<div class="cf-name">' + escHtml(it.name) + '</div>' +
+            '<div class="cf-path">' + escHtml(路径) + '</div>' +
+            '<div class="cf-warn">文件会被移入<b>回收站</b>，不是彻底删除，' +
+            '随时都能从回收站还原。</div>',
+      buttons: [
+        { text: '取消', kind: '',       onClick: closeModal },
+        { text: '删除', kind: 'danger', onClick: function () { closeModal(); doDelete(index, 路径); } }
+      ]
+    });
+  }
+
+  function doDelete(index, 路径) {
+    var 是当前项 = (index === plIndex);
+
+    // 删之前先把正在播的这个放开：
+    // Windows 上文件被播放器占着的时候是删不掉的（共享冲突），必须先松手
+    if (是当前项) { releaseVideo(); }
+
+    // 给系统一点时间真正释放文件句柄，再让小桥动手
+    setTimeout(function () {
+      bridgeCall('delete', 路径, function (错, 数据) {
+        if (错) {
+          console.log('[冰冰播放器] 删除失败：' + 错);
+          showToast('删除失败：' + 错);
+          // 刚把视频放开了，这时候得把画面找回来，别让用户对着黑屏
+          if (是当前项) { playItem(index, false); }
+          return;
+        }
+        console.log('[冰冰播放器] 已删除：' + 路径 +
+                    '（' + ((数据 && 数据.reason) || '') + '）');
+        removeItemAt(index);
+      });
+    }, 180);
+  }
+
+  // 把画面彻底放开（暂停 + 清掉 src），但不动列表
+  function releaseVideo() {
+    video.pause();
+    if (currentUrl) {
+      URL.revokeObjectURL(currentUrl);
+      currentUrl = null;
+    }
+    video.removeAttribute('src');
+    video.load();
+    console.log('[冰冰播放器] 已释放当前视频（准备删文件）');
+  }
+
+  // 文件删掉之后，把它从列表里摘掉，并把画面顺到下一项
+  function removeItemAt(index) {
+    var 删的是当前项 = (index === plIndex);
+    var 当前项 = (plIndex >= 0) ? playlist[plIndex] : null;
+
+    playlist.splice(index, 1);
+
+    if (删的是当前项) {
+      plIndex = -1;
+      if (playlist.length === 0) {
+        showToast('已移入回收站\n列表空了');
+        clearToEmpty();
+        return;
+      }
+      // 接着放原位置上的那一个（删的是最后一个就往前退一格）
+      var 下一个 = Math.min(index, playlist.length - 1);
+      refreshPlaylist();
+      // 不自动出声：删个文件不该突然响起来
+      playItem(下一个, false);
+      showToast('已移入回收站');
+      return;
+    }
+
+    // 删的不是当前项：高亮按「对象引用」找回来（下标会挪位，不能直接用旧下标）
+    plIndex = 当前项 ? playlist.indexOf(当前项) : -1;
+    refreshPlaylist();
+    refreshActiveItem();
+    showToast('已移入回收站');
+  }
+
+  // 列表空了：把画面清干净，回到引导态
+  function clearToEmpty() {
+    releaseVideo();
+    setAudioMode(false);      // 音频占位也一并收掉，别让上一个歌名留在黑屏上
+    fnameEl.textContent = '';
+    fmetaEl.textContent = '';
+    emptyBox.classList.remove('hide');
+    app.classList.add('no-file');
+    refreshPlaylist();
+  }
+
+  /* ---------- 5.7.3 排序控件 ---------- */
+
+  // 各排序字段的默认方向：
+  //   时间     → 倒序（新的在前，这是最常用的看法，也是需求里的默认）
+  //   其余字段 → 正序（文件名 A→Z、体积小→大、类型按扩展名归拢）
+  function defaultAscFor(field) {
+    return field !== 'time';
+  }
+
+  // 初始化排序下拉框
+  function buildSortOptions() {
+    for (var i = 0; i < SORT_FIELDS.length; i++) {
+      var opt = document.createElement('option');
+      opt.value       = SORT_FIELDS[i].id;
+      opt.textContent = SORT_FIELDS[i].label;
+      plSort.appendChild(opt);
+    }
+    plSort.value = plSortField;
+    updateOrderBtn();
+  }
+
+  // 刷新正倒序按钮的箭头与提示
+  function updateOrderBtn() {
+    plOrder.textContent = plSortAsc ? '↑' : '↓';
+    plOrder.title = plSortAsc
+      ? '当前：正序（点击切为倒序）'
+      : '当前：倒序（点击切为正序）';
+  }
+
+  /* ==================================================================
+     六、全屏
+     ================================================================== */
+
+  // 窗口 ↔ 全屏切换（对整个应用容器请求，保证控制条也在全屏内）
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) {
+      app.requestFullscreen().catch(function (err) {
+        console.log('[冰冰播放器] 进入全屏失败：' + err);
+        showToast('无法进入全屏');
+      });
+    } else {
+      document.exitFullscreen().catch(function (err) {
+        console.log('[冰冰播放器] 退出全屏失败：' + err);
+      });
+    }
+  }
+
+  // 全屏图标切换
+  function refreshFullIcon() {
+    var on = !!document.fullscreenElement;
+    fullIcon.innerHTML = on
+      ? '<path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>'
+      : '<path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>';
+  }
+
+  // 静音图标
+  function refreshMuteIcon() {
+    var muted = video.muted || video.volume === 0;
+    muteIcon.innerHTML = muted
+      ? '<path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>'
+      : '<path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2c0-1.8-1-3.3-2.5-4v8c1.5-.7 2.5-2.2 2.5-4zM14 3.2v2.1c2.9.9 5 3.6 5 6.7s-2.1 5.8-5 6.7v2.1c4-1 7-4.6 7-8.8s-3-7.8-7-8.8z"/>';
+  }
+
+  // 播放/暂停图标
+  function refreshPlayIcon() {
+    btnPlay.innerHTML = video.paused
+      ? '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+  }
+
+  /* ==================================================================
+     六点五、关闭窗口
+     ================================================================== */
+
+  // 点右上角的 × 直接关掉浏览器窗口。
+  // 已实测：Chrome / Edge 的「应用模式」（--app= 启动，本播放器就是这么起的）
+  // 允许页面脚本关掉自己，window.close() 会把整个窗口连同浏览器进程一起收掉。
+  // 普通标签页则不允许脚本关窗 —— 那种情况给一句提示，别让人以为按钮坏了。
+  function closeWindow() {
+    console.log('[冰冰播放器] 请求关闭窗口');
+    window.close();
+    // 兜底提示：真关掉时页面已被销毁，这个定时器根本没机会执行
+    setTimeout(function () {
+      if (!window.closed) {
+        showToast('浏览器不允许网页自行关闭\n请按 Alt + F4');
+      }
+    }, 900);
+  }
+
+  /* ==================================================================
+     七、控制条自动隐藏
+     ================================================================== */
+
+  function wakeControls() {
+    app.classList.remove('idle');
+    clearTimeout(hideTimer);
+    // 暂停时不隐藏控制条，方便操作；
+    // 播放列表展开时也不隐藏，否则用户没法慢慢翻列表
+    if (video.paused || plOpen) { return; }
+    hideTimer = setTimeout(function () {
+      app.classList.add('idle');
+    }, 2500);
+  }
+
+  /* ==================================================================
+     八、事件绑定
+     ================================================================== */
+
+  /* ---------- 8.1 拖放 ---------- */
+  // 必须对 dragover 做 preventDefault，否则浏览器不会触发 drop
+  window.addEventListener('dragover', function (e) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+
+  window.addEventListener('dragenter', function (e) {
+    e.preventDefault();
+    dragDepth++;
+    if (dragDepth > 0) { dropMask.classList.add('show'); }
+  });
+
+  window.addEventListener('dragleave', function (e) {
+    e.preventDefault();
+    dragDepth--;
+    if (dragDepth <= 0) {
+      dragDepth = 0;
+      dropMask.classList.remove('show');
+    }
+  });
+
+  // 拖入的可能是文件，也可能是文件夹；
+  // 文件夹要递归读取，具体交给 handleDrop 处理
+  window.addEventListener('drop', function (e) {
+    e.preventDefault();
+    dragDepth = 0;
+    dropMask.classList.remove('show');
+    handleDrop(e.dataTransfer);
+  });
+
+  /* ---------- 8.2 点击选择文件 ---------- */
+  document.getElementById('pickBtn').addEventListener('click', function () {
+    fileInput.click();
+  });
+
+  fileInput.addEventListener('change', function () {
+    // 支持多选，整批一起进列表
+    if (fileInput.files && fileInput.files.length > 0) {
+      loadFilesToList(fileInput.files);
+    }
+    // 清空，保证同一个文件再次选择也能触发 change
+    fileInput.value = '';
+  });
+
+  /* ---------- 8.3 键盘快捷键 ---------- */
+  document.addEventListener('keydown', function (e) {
+    // 弹窗开着的时候：只认 Esc 和回车。
+    // 不加这道闸的话，按空格会把弹窗后面的视频给暂停了，很莫名其妙
+    if (modalOpen) {
+      if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+      if (e.key === 'Enter' && modalEnter) { e.preventDefault(); modalEnter(); return; }
+      return;
+    }
+
+    var ae = document.activeElement;
+
+    // 焦点在搜索框里时所有快捷键一律让路，否则根本没法打字。
+    // 只放行 Esc：清空关键词并退出输入框
+    if (ae && ae.id === 'plSearch') {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        plSearch.value = '';
+        plQuery = '';
+        plClear.classList.remove('show');
+        refreshPlaylist();
+        plSearch.blur();
+      }
+      return;
+    }
+
+    // 若焦点落在按钮或滑块上，先移除焦点，避免回车重复触发按钮点击
+    if (ae && (ae.tagName === 'BUTTON' || ae.tagName === 'INPUT' || ae.tagName === 'SELECT')) {
+      ae.blur();
+    }
+
+    var key = e.key;
+
+    // 左右方向键：Ctrl 按下时步长 60 秒，否则 5 秒
+    if (key === 'ArrowLeft') {
+      e.preventDefault();
+      seekBy(e.ctrlKey ? -60 : -5);
+      wakeControls();
+      return;
+    }
+    if (key === 'ArrowRight') {
+      e.preventDefault();
+      seekBy(e.ctrlKey ? 60 : 5);
+      wakeControls();
+      return;
+    }
+
+    // 空格：播放 / 暂停
+    if (key === ' ' || key === 'Spacebar' || e.code === 'Space') {
+      e.preventDefault();
+      if (!video.src) { return; }
+      if (video.paused) {
+        video.play().catch(function (err) {
+          console.log('[冰冰播放器] 播放失败：' + err);
+          showToast('播放失败');
+        });
+      } else {
+        video.pause();
+      }
+      wakeControls();
+      return;
+    }
+
+    // 回车：窗口 / 全屏
+    if (key === 'Enter') {
+      e.preventDefault();
+      toggleFullscreen();
+      return;
+    }
+
+    // 上下方向键：音量
+    if (key === 'ArrowUp') {
+      e.preventDefault();
+      video.volume = Math.min(1, video.volume + 0.05);
+      video.muted = false;
+      showToast('音量 ' + Math.round(video.volume * 100) + '%');
+      wakeControls();
+      return;
+    }
+    if (key === 'ArrowDown') {
+      e.preventDefault();
+      video.volume = Math.max(0, video.volume - 0.05);
+      showToast('音量 ' + Math.round(video.volume * 100) + '%');
+      wakeControls();
+      return;
+    }
+
+    // M：静音切换
+    if (key === 'm' || key === 'M') {
+      e.preventDefault();
+      video.muted = !video.muted;
+      showToast(video.muted ? '已静音' : '已取消静音');
+      wakeControls();
+      return;
+    }
+
+    /* 以下快捷键统一用 e.code 判「物理键位」而非 e.key，原因有三个：
+         1. 主键盘的 + 本来就是 = 键配合 Shift 打出来的，用 key 判会漏掉不按 Shift 的情况
+         2. 小键盘的 + / - 不需要 Shift，用 key 判又和主键盘混在一起分不清
+         3. e.code 不受中文输入法、键盘布局影响，最稳
+    */
+    var code = e.code;
+
+    /* ---- ? 或 F1：打开快捷键表 ----
+       '?' 是 Shift + / 打出来的；中文输入法下会变成全角的「？」，两种都收 */
+    if (e.key === '?' || e.key === '？' || code === 'F1') {
+      e.preventDefault();
+      showHelp();
+      return;
+    }
+
+    /* ---- DEL：删除当前文件（先弹确认，删进回收站）---- */
+    if (code === 'Delete' || e.key === 'Delete') {
+      e.preventDefault();
+      if (plIndex < 0) { showToast('没有正在播放的文件'); return; }
+      askDelete(plIndex);
+      return;
+    }
+
+    /* ---- 画面几何：[ 左转 90° / ] 右转 90° / R 复位（旋转 + 缩放一起收回来）---- */
+    if (code === 'BracketLeft') {
+      e.preventDefault();
+      rotateLeft();
+      return;
+    }
+    if (code === 'BracketRight') {
+      e.preventDefault();
+      rotateRight();
+      return;
+    }
+    if (code === 'KeyR') {
+      e.preventDefault();
+      viewReset();
+      return;
+    }
+
+    /* ---- 逐帧步进：F 下一帧 / D 上一帧 ----
+       用 KeyF / KeyD 判物理键位，理由与上面那段说明相同。
+       按住不放会走系统的按键重复，正好可以当「连续蹭帧」用 */
+    if (code === 'KeyF') {
+      e.preventDefault();
+      stepFrame(1);
+      return;
+    }
+    if (code === 'KeyD') {
+      e.preventDefault();
+      stepFrame(-1);
+      return;
+    }
+
+    /* ---- 播放列表：N 下一个 / P 上一个 / L 展开收起 ---- */
+    if (code === 'KeyN') {
+      e.preventDefault();
+      stepPlaylist(1);
+      return;
+    }
+    if (code === 'KeyP') {
+      e.preventDefault();
+      stepPlaylist(-1);
+      return;
+    }
+    if (code === 'KeyL') {
+      e.preventDefault();
+      togglePlaylist();
+      // 放在 toggle 之后：wakeControls 会先摘掉 idle，
+      // 再按「切换后的」状态决定要不要重新计时（展开时不淡出，收起时恢复计时）
+      wakeControls();
+      return;
+    }
+
+    /* ---- 翻页键：PageUp 上一个 / PageDown 下一个（与 N / P 同义）----
+       很多无线键盘和笔记本把方向键与翻页键做在一起，多一组更顺手 */
+    if (code === 'PageUp') {
+      e.preventDefault();
+      stepPlaylist(-1);
+      return;
+    }
+    if (code === 'PageDown') {
+      e.preventDefault();
+      stepPlaylist(1);
+      return;
+    }
+
+    /* ---- Home 跳到列表第一个 / End 跳到列表最后一个 ---- */
+    if (code === 'Home') {
+      e.preventDefault();
+      jumpPlaylist(false);
+      return;
+    }
+    if (code === 'End') {
+      e.preventDefault();
+      jumpPlaylist(true);
+      return;
+    }
+
+    /* ---- 播放速度：+ 加速 / - 减速 / 0 恢复原始速度 ----
+       对应关系：
+         Equal           主键盘的 = 键（Shift 后即 +）
+         NumpadAdd       小键盘 +
+         Minus           主键盘的 - 键（Shift 后是 _）
+         NumpadSubtract  小键盘 -
+         Digit0 / Numpad0   数字 0
+    */
+    if (code === 'Equal' || code === 'NumpadAdd') {
+      e.preventDefault();
+      speedUp();
+      return;
+    }
+    if (code === 'Minus' || code === 'NumpadSubtract') {
+      e.preventDefault();
+      speedDown();
+      return;
+    }
+    if (code === 'Digit0' || code === 'Numpad0') {
+      e.preventDefault();
+      speedReset();
+      return;
+    }
+  });
+
+  /* ---------- 8.4 video 事件 ---------- */
+  video.addEventListener('play', function () {
+    refreshPlayIcon();
+    wakeControls();
+    app.classList.add('playing');       // 音频占位的唱片转起来
+    console.log('[冰冰播放器] 状态：播放中');
+  });
+
+  video.addEventListener('pause', function () {
+    refreshPlayIcon();
+    wakeControls();
+    app.classList.remove('playing');
+    console.log('[冰冰播放器] 状态：已暂停');
+  });
+
+  // 元数据就绪：拿到时长，刷新时间显示
+  video.addEventListener('loadedmetadata', function () {
+    timeAll.textContent = fmtTime(video.duration);
+    console.log('[冰冰播放器] 元数据就绪 | 时长 ' + fmtTime(video.duration) +
+                ' | 原始分辨率 ' + video.videoWidth + 'x' + video.videoHeight);
+    layoutFrame();
+  });
+
+  // 播放进度更新
+  video.addEventListener('timeupdate', function () {
+    if (isSeeking) { return; }
+    var pct = 0;
+    if (isFinite(video.duration) && video.duration > 0) {
+      pct = video.currentTime / video.duration;
+    }
+    progress.value = Math.round(pct * 1000);
+    setRangeFill(progress, pct * 100);
+    timeNow.textContent = fmtTime(video.currentTime);
+  });
+
+  // 解码出错：给出明确原因
+  video.addEventListener('error', function () {
+    // 切换视频时 src 会被替换，可能产生一次空源错误，忽略它
+    if (!video.src) { return; }
+    var code = video.error ? video.error.code : 0;
+    var text = MEDIA_ERR_TEXT[code] || '未知播放错误';
+    console.log('[冰冰播放器] video 错误 | code=' + code + ' | ' + text);
+    showError('<b>' + text + '</b><br>如果这是 mp4 文件，可能是 H.265/HEVC 等特殊编码，<br>可尝试用 ffmpeg 转为 H.264 后再播放。');
+  });
+
+  // 播放结束：控制条保持可见，并自动连播下一项
+  video.addEventListener('ended', function () {
+    app.classList.remove('idle');
+    clearTimeout(hideTimer);
+    console.log('[冰冰播放器] 播放结束');
+
+    // 自动连播；已经是可见列表的最后一条就停在末尾，不循环
+    var pos = plVisible.indexOf(plIndex);
+    if (pos >= 0 && pos + 1 < plVisible.length) {
+      console.log('[冰冰播放器] 自动连播下一项');
+      playItem(plVisible[pos + 1]);
+    }
+  });
+
+  // 音量变化：同步滑块与图标
+  video.addEventListener('volumechange', function () {
+    var v = video.muted ? 0 : video.volume;
+    volSlider.value = Math.round(v * 100);
+    setRangeFill(volSlider, v * 100);
+    volPct.textContent = Math.round(v * 100) + '%';
+    refreshMuteIcon();
+  });
+
+  /* ---------- 8.5 进度条拖动 ---------- */
+  // input 事件只在用户交互时触发，程序改 value 不会触发，天然区分
+  progress.addEventListener('input', function () {
+    if (!isFinite(video.duration) || video.duration <= 0) { return; }
+    isSeeking = true;
+    var pct = progress.value / 1000;
+    setRangeFill(progress, pct * 100);
+    timeNow.textContent = fmtTime(pct * video.duration);
+  });
+
+  progress.addEventListener('change', function () {
+    if (!isFinite(video.duration) || video.duration <= 0) { return; }
+    video.currentTime = (progress.value / 1000) * video.duration;
+    isSeeking = false;
+  });
+
+  /* ---------- 8.6 音量拖动 ---------- */
+  volSlider.addEventListener('input', function () {
+    var v = volSlider.value / 100;
+    video.volume = v;
+    // 拖动音量条时自动解除静音，符合直觉
+    if (v > 0 && video.muted) { video.muted = false; }
+    setRangeFill(volSlider, volSlider.value);
+    volPct.textContent = volSlider.value + '%';
+  });
+
+  /* ---------- 8.7 比例与填充 ---------- */
+  selRatio.addEventListener('change', function () {
+    var id = selRatio.value;
+    for (var i = 0; i < RATIO_PRESETS.length; i++) {
+      if (RATIO_PRESETS[i].id === id) {
+        currentRatio = RATIO_PRESETS[i];
+        break;
+      }
+    }
+    layoutFrame();
+    console.log('[冰冰播放器] 切换比例：' + currentRatio.label);
+    showToast('比例：' + currentRatio.label);
+  });
+
+  selFit.addEventListener('change', function () {
+    video.style.objectFit = selFit.value;
+    console.log('[冰冰播放器] 切换填充方式：' + selFit.value);
+  });
+
+  /* ---------- 8.8 播放按钮 / 静音 / 全屏 ---------- */
+  btnPlay.addEventListener('click', function () {
+    if (!video.src) { return; }
+    if (video.paused) {
+      video.play().catch(function (err) {
+        console.log('[冰冰播放器] 播放失败：' + err);
+      });
+    } else {
+      video.pause();
+    }
+  });
+
+  btnMute.addEventListener('click', function () {
+    video.muted = !video.muted;
+    console.log('[冰冰播放器] 静音状态：' + video.muted);
+  });
+
+  btnFull.addEventListener('click', toggleFullscreen);
+
+  // 点击速度按钮：直接恢复原始速度
+  btnSpeed.addEventListener('click', function () {
+    speedReset();
+  });
+
+  // 画面旋转按钮
+  btnRotL.addEventListener('click', rotateLeft);
+  btnRotR.addEventListener('click', rotateRight);
+
+  // 右上角关闭按钮：点一下关掉整个浏览器窗口
+  winClose.addEventListener('click', closeWindow);
+
+  // 滚轮缩放。绑定在舞台上而不是 document 上 ——
+  // 舞台里只有画面（播放列表、控制条、顶部条都是它的兄弟节点），
+  // 这样鼠标滚过播放列表时不会被这里抢走，列表照样能滚。
+  // passive: false 是必须的：只有非被动监听才允许 preventDefault。
+  stage.addEventListener('wheel', function (e) {
+    // 一定要拦下默认行为：否则 Ctrl+滚轮 会触发 Chrome 自己的页面缩放，
+    // 普通滚轮也会让页面上下弹动
+    e.preventDefault();
+    if (!video.src) { return; }
+
+    var up = e.deltaY < 0;
+
+    // 到顶 / 到底时回一句话，不然用户会以为滚轮坏了
+    if (up && zoom >= ZOOM_MAX) { showToast('已经放到最大 ' + ZOOM_MAX + ' 倍'); return; }
+    if (!up && zoom <= ZOOM_MIN) { showToast('已经是原始大小'); return; }
+
+    zoomAt(up ? zoom * ZOOM_STEP : zoom / ZOOM_STEP, e.clientX, e.clientY);
+    wakeControls();
+  }, { passive: false });
+
+  document.getElementById('btnBack60').addEventListener('click', function () { seekBy(-60); });
+  document.getElementById('btnFwd60').addEventListener('click', function () { seekBy(60); });
+
+  /* ---------- 8.9 点击画面播放/暂停 ---------- */
+  video.addEventListener('click', function () {
+    if (video.paused) {
+      video.play().catch(function (err) {
+        console.log('[冰冰播放器] 播放失败：' + err);
+      });
+    } else {
+      video.pause();
+    }
+  });
+
+  /* ---------- 8.10 鼠标活动 / 尺寸变化 ---------- */
+  app.addEventListener('mousemove', wakeControls);
+  app.addEventListener('mouseleave', function () {
+    // 面板展开时保持可见，别让鼠标一移出窗口整个界面就消失
+    if (!video.paused && !plOpen) { app.classList.add('idle'); }
+  });
+
+  window.addEventListener('resize', function () {
+    layoutFrame();
+  });
+
+  document.addEventListener('fullscreenchange', function () {
+    refreshFullIcon();
+    // 全屏切换后舞台尺寸变了，重新计算视频框
+    layoutFrame();
+    setTimeout(layoutFrame, 60);
+    wakeControls();
+    console.log('[冰冰播放器] 全屏状态：' + (document.fullscreenElement ? '开' : '关'));
+  });
+
+  /* ---------- 8.11 播放列表面板 ---------- */
+
+  // 控制条上的开关按钮
+  btnPlList.addEventListener('click', togglePlaylist);
+
+  // 面板标题栏的收起按钮
+  document.getElementById('plClose').addEventListener('click', function () {
+    setPlaylistOpen(false);
+  });
+
+  // 列表项点击。
+  // 用事件委托而不是逐项绑定：列表内容每次刷新都是整体重建的，
+  // 逐项绑定会在重建后全部失效
+  plListEl.addEventListener('click', function (e) {
+    // 行尾的动作小图标优先：命中了就干它的事，别再冒泡到下面去「播放这一项」
+    var 图标 = e.target.closest ? e.target.closest('.pl-icon') : null;
+    if (图标) {
+      e.stopPropagation();
+      var 图标行 = 图标.closest('.pl-item');
+      var 图标序号 = 图标行 ? parseInt(图标行.getAttribute('data-i'), 10) : -1;
+      if (图标序号 >= 0) { runRowAction(图标.getAttribute('data-act'), 图标序号); }
+      return;
+    }
+
+    var el = e.target;
+    while (el && el !== plListEl) {
+      if (el.classList && el.classList.contains('pl-item')) {
+        playItem(parseInt(el.getAttribute('data-i'), 10));
+        return;
+      }
+      el = el.parentNode;
+    }
+  });
+
+  // 搜索框：输入即时过滤
+  plSearch.addEventListener('input', function () {
+    plQuery = plSearch.value.trim();
+    if (plQuery) {
+      plClear.classList.add('show');
+    } else {
+      plClear.classList.remove('show');
+    }
+    refreshPlaylist();
+  });
+
+  // 清空搜索
+  plClear.addEventListener('click', function () {
+    plSearch.value = '';
+    plQuery = '';
+    plClear.classList.remove('show');
+    plSearch.focus();
+    refreshPlaylist();
+  });
+
+  // 排序字段切换。
+  // 换字段时给一个符合直觉的默认方向，而不是死守上一次的方向 ——
+  // 选「按文件名」时大家期望的是 A→Z，不是继续沿用上次的倒序
+  plSort.addEventListener('change', function () {
+    plSortField = plSort.value;
+    plSortAsc   = defaultAscFor(plSortField);
+    updateOrderBtn();
+    refreshPlaylist();
+    showToast(plSort.options[plSort.selectedIndex].text + ' · ' + (plSortAsc ? '正序' : '倒序'));
+    console.log('[冰冰播放器] 排序：' + plSortField + ' | ' + (plSortAsc ? '正序' : '倒序'));
+  });
+
+  // 正 / 倒序切换
+  plOrder.addEventListener('click', function () {
+    plSortAsc = !plSortAsc;
+    updateOrderBtn();
+    refreshPlaylist();
+    showToast(plSortAsc ? '正序排列' : '倒序排列');
+  });
+
+  /* ==================================================================
+     九、启动初始化
+     ================================================================== */
+  function init() {
+    buildRatioOptions();
+    buildSortOptions();
+    refreshPlaylist();   // 先渲染出「列表为空」的引导文案
+    layoutFrame();
+    refreshPlayIcon();
+    refreshMuteIcon();
+    applySpeed();   // 初始化速度按钮的文字与高亮状态
+
+    // 【不留痕】这里原先会恢复上次记下的音量、并在音量变化时写回 localStorage。
+    // 现在两头都去掉：每次打开都用浏览器默认音量（100%），关掉即忘。
+    setRangeFill(volSlider, video.volume * 100);
+    volPct.textContent = Math.round(video.volume * 100) + '%';
+
+    // 先接管小桥信息，再读本地清单：
+    // 端口与口令就在启动地址的 #bbp= 片段里（见 readBridge 的说明）
+    readBridge();
+    startBridgeHeartbeat();
+
+    // 尝试读取启动器扫描生成的本地清单。
+    // 这一步是异步的：清单不存在会走 onerror，不阻塞播放器启动
+    loadDiskPlaylist();
+
+    console.log('[冰冰播放器] 初始化完成 | 内核支持情况：' +
+      'mp4=' + (video.canPlayType('video/mp4') || '否') +
+      ' | webm=' + (video.canPlayType('video/webm') || '否'));
+  }
+
+  init();
+
+})();
+</script>
+
+</body>
+</html>
